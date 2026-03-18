@@ -17,6 +17,7 @@ from app.schemas import (
 )
 from app.services.upload_service import process_upload
 from app.services import stats_service
+from app.api.v1.pruebas_router import router as pruebas_router
 from app.services.stats_service import (
     AsistenciaPorCarrera,
     TendenciaGrupo,
@@ -29,6 +30,7 @@ from app.services.stats_service import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["universidad-saludable"])
+router.include_router(pruebas_router)
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xls"}
 

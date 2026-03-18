@@ -39,17 +39,22 @@ universidad-saludable-api/
 │   ├── db/
 │   │   └── session.py              # Engine SQLAlchemy + get_db() dependency
 │   ├── models/
-│   │   └── __init__.py             # ORM: Upload, Grupo, Alumno, Asistencia
+│   │   ├── __init__.py             # ORM: Upload, Grupo, Alumno, Asistencia
+│   │   └── pruebas.py              # ORM: Seguimiento, SeguimientoGrupo, PruebaFisica, PeriodoSeguimiento, ResultadoPrueba
 │   ├── schemas/
-│   │   └── __init__.py             # Pydantic response models
+│   │   ├── __init__.py             # Pydantic response models (asistencia)
+│   │   └── pruebas.py              # Pydantic schemas del módulo de pruebas físicas
 │   └── services/
 │       ├── excel_parser.py         # Parseo tolerante del Excel por hojas
 │       ├── upload_service.py       # Persistencia del Excel parseado en BD
-│       └── stats_service.py        # Consultas de análisis estadístico
+│       ├── stats_service.py        # Consultas de análisis estadístico
+│       ├── pruebas_service.py      # Lógica de negocio del módulo de pruebas físicas
+│       └── plantilla_service.py    # Generación y parseo del Excel plantilla
 ├── alembic/
 │   ├── env.py
 │   └── versions/
-│       └── 57c94bd6b379_initial_schema.py
+│       ├── 57c94bd6b379_initial_schema.py
+│       └── b4f9c2d8e1a3_pruebas_fisicas.py
 ├── main.py                         # Entrypoint uvicorn
 ├── requirements.txt
 ├── alembic.ini
@@ -111,7 +116,7 @@ source .venv/bin/activate
 alembic upgrade head
 ```
 
-Esto crea las 4 tablas: `uploads`, `grupos`, `alumnos`, `asistencias`.
+Esto crea las 9 tablas: `uploads`, `grupos`, `alumnos`, `asistencias`, `seguimientos`, `seguimiento_grupos`, `pruebas_fisicas`, `periodos_seguimiento`, `resultados_prueba`.
 
 ### 5. Levantar el servidor
 
@@ -164,7 +169,7 @@ Un registro por alumno por grupo.
 | limpieza | NUMERIC | Puntos obtenidos en taller de Limpieza |
 | coae | NUMERIC | Puntos obtenidos en taller COAE |
 | taller | NUMERIC | Puntos obtenidos en Taller general |
-| total | NUMERIC | Calificación final total |
+| total | NUMERIC | Suma de talleres (NUTRICIÓN+FISIO+LIMPIEZA+COAE+TALLER). Máx. 40 pts. Independiente de asistencia. Expuesto en la API como `total_talleres` |
 
 ### `asistencias`
 Una fila por alumno por fecha de sesión.
@@ -175,6 +180,69 @@ Una fila por alumno por fecha de sesión.
 | alumno_id | INTEGER FK | Referencia a `alumnos` |
 | fecha | DATE | Fecha de la sesión (formato YYYY-MM-DD) |
 | valor | NUMERIC | 2.5 = asistió, 0 = falta |
+
+---
+
+## Módulo de pruebas físicas — Modelo de base de datos
+
+### `seguimientos`
+Configuración de un seguimiento de pruebas físicas (ej. "Pruebas físicas Enero-Mayo 2025").
+
+| Columna | Tipo | Descripción |
+|---|---|---|
+| id | INTEGER PK | Autoincremental |
+| nombre | VARCHAR | Nombre descriptivo del seguimiento |
+| descripcion | TEXT | Descripción opcional |
+| aplica_a_todos | BOOLEAN | Si aplica a todos los grupos del departamento |
+| activo | BOOLEAN | Estado activo/inactivo |
+| created_at | TIMESTAMP | Fecha de creación |
+
+### `seguimiento_grupos`
+Grupos de alumnos que participan en un seguimiento.
+
+| Columna | Tipo | Descripción |
+|---|---|---|
+| id | INTEGER PK | Autoincremental |
+| seguimiento_id | INTEGER FK | Referencia a `seguimientos` |
+| nombre_grupo | VARCHAR | Nombre del grupo (ej. "ATLETISMO 1") |
+| descripcion | TEXT | Descripción opcional del grupo |
+
+### `pruebas_fisicas`
+Pruebas configuradas para un seguimiento (ej. "Flexiones", "Resistencia 1km").
+
+| Columna | Tipo | Descripción |
+|---|---|---|
+| id | INTEGER PK | Autoincremental |
+| seguimiento_id | INTEGER FK | Referencia a `seguimientos` |
+| nombre | VARCHAR | Nombre de la prueba |
+| unidad | VARCHAR | Unidad de medida (ej. "reps/min", "segundos", "metros") |
+| mayor_es_mejor | BOOLEAN | Indica si un valor más alto significa mejor resultado |
+
+### `periodos_seguimiento`
+Momentos de medición dentro de un semestre (Inicial, Medio, Final).
+
+| Columna | Tipo | Descripción |
+|---|---|---|
+| id | INTEGER PK | Autoincremental |
+| seguimiento_id | INTEGER FK | Referencia a `seguimientos` |
+| semestre_label | VARCHAR | Etiqueta del semestre (ej. "Enero-Mayo 2025") |
+| nombre_periodo | VARCHAR | Nombre del momento (ej. "Inicial", "Medio", "Final") |
+| fecha | DATE | Fecha de aplicación de las pruebas |
+
+### `resultados_prueba`
+Resultado individual de un alumno en una prueba para un periodo dado.
+
+| Columna | Tipo | Descripción |
+|---|---|---|
+| id | INTEGER PK | Autoincremental |
+| periodo_id | INTEGER FK | Referencia a `periodos_seguimiento` |
+| prueba_id | INTEGER FK | Referencia a `pruebas_fisicas` |
+| grupo_id | INTEGER FK nullable | Referencia a `seguimiento_grupos` — FK nullable necesaria para poder filtrar y agrupar en los endpoints de análisis (`/progreso`, `/ranking-mejora`) |
+| matricula | VARCHAR | Matrícula del alumno |
+| nombre_alumno | VARCHAR | Nombre del alumno |
+| genero | VARCHAR | Género (opcional) |
+| edad | INTEGER | Edad (opcional) |
+| valor | NUMERIC | Resultado obtenido (NULL si la celda no era numérica) |
 
 ---
 
@@ -248,6 +316,91 @@ Promedio de asistencia agrupado por semestre que cursa el alumno. Excluye regist
 #### `GET /stats/uploads/{upload_id}/ranking-grupos`
 Ranking de grupos ordenados por porcentaje de asistencia promedio de sus alumnos, de mayor a menor.
 
+### Pruebas físicas (`/api/v1/pruebas`)
+
+#### Gestión de seguimientos
+
+#### `POST /pruebas/seguimientos`
+Crea un nuevo seguimiento de pruebas físicas.
+- **Body JSON:** `nombre`, `descripcion` (opcional), `aplica_a_todos` (bool)
+- **Response:** Detalle completo del seguimiento creado
+
+#### `GET /pruebas/seguimientos`
+Lista todos los seguimientos con conteo de grupos y pruebas configuradas.
+
+#### `GET /pruebas/seguimientos/{seguimiento_id}`
+Detalle de un seguimiento: sus grupos y pruebas físicas configuradas.
+- **Errores:** 404 si no existe
+
+#### `PATCH /pruebas/seguimientos/{seguimiento_id}`
+Actualiza nombre, descripción o estado activo/inactivo. Solo los campos enviados se modifican.
+- **Body JSON:** `nombre`, `descripcion`, `activo` (todos opcionales)
+- **Errores:** 404 si no existe
+
+#### Grupos del seguimiento
+
+#### `POST /pruebas/seguimientos/{seguimiento_id}/grupos`
+Agrega un grupo al seguimiento.
+- **Body JSON:** `nombre_grupo`, `descripcion` (opcional)
+- **Errores:** 404 si no existe el seguimiento
+
+#### `DELETE /pruebas/seguimientos/{seguimiento_id}/grupos/{grupo_id}`
+Elimina un grupo del seguimiento y sus resultados asociados (cascade).
+- **Errores:** 404 si no existe el seguimiento o el grupo
+
+#### Pruebas del seguimiento
+
+#### `POST /pruebas/seguimientos/{seguimiento_id}/pruebas`
+Agrega una prueba física al seguimiento.
+- **Body JSON:** `nombre`, `unidad` (opcional), `mayor_es_mejor` (bool)
+- **Errores:** 404 si no existe el seguimiento
+
+#### `DELETE /pruebas/seguimientos/{seguimiento_id}/pruebas/{prueba_id}`
+Elimina una prueba del seguimiento y sus resultados asociados (cascade).
+- **Errores:** 404 si no existe el seguimiento o la prueba
+
+#### Periodos
+
+#### `POST /pruebas/seguimientos/{seguimiento_id}/periodos`
+Crea un periodo de medición (ej. Inicial, Medio, Final).
+- **Body JSON:** `semestre_label`, `nombre_periodo`, `fecha` (YYYY-MM-DD)
+- **Errores:** 404 si no existe el seguimiento
+
+#### `GET /pruebas/seguimientos/{seguimiento_id}/periodos`
+Lista todos los periodos del seguimiento agrupados por `semestre_label`.
+- **Errores:** 404 si no existe el seguimiento
+
+#### Plantilla Excel
+
+#### `GET /pruebas/periodos/{periodo_id}/plantilla`
+Genera y descarga un archivo Excel (.xlsx) con una hoja por grupo, columnas fijas (Matricula, Nombre, Genero, Edad) más una columna por prueba física, y metadatos en la fila 0.
+- **Response:** `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- **Errores:** 404 si no existe el periodo; 400 si el seguimiento no tiene grupos configurados
+
+#### `POST /pruebas/periodos/{periodo_id}/resultados`
+Recibe el Excel llenado (mismo formato que la plantilla), lo parsea y guarda los resultados.
+- **Body:** `multipart/form-data` con campo `file` (.xlsx)
+- **Response:** `{ total_procesadas, total_guardadas, total_saltadas }`
+- **Tolerancia:** filas con matrícula vacía se saltan y loguean; celdas no numéricas se guardan como NULL; nunca falla por una fila mala
+- **Errores:** 404 si no existe el periodo; 400 si el archivo no es Excel o está vacío
+
+#### Análisis
+
+#### `GET /pruebas/seguimientos/{seguimiento_id}/progreso`
+Progreso por alumno entre los periodos de un semestre. Devuelve por alumno, por prueba: el valor en cada periodo y la diferencia entre el primero y el último con dato.
+- **Query params:** `semestre_label` (requerido), `grupo_id` (int, opcional)
+- **Errores:** 404 si no existe el seguimiento
+
+#### `GET /pruebas/seguimientos/{seguimiento_id}/ranking-mejora`
+Ranking de grupos por mejora promedio entre el primer y último periodo de un semestre. Ordenado de mayor a menor diferencia.
+- **Query params:** `semestre_label` (requerido)
+- **Response:** por grupo y prueba: promedio inicial, promedio final, diferencia y porcentaje de mejora
+- **Errores:** 404 si no existe el seguimiento; devuelve lista vacía si hay menos de 2 periodos
+
+#### `GET /pruebas/seguimientos/{seguimiento_id}/historico`
+Comparativo del promedio por prueba entre semestres distintos. Usa el periodo final (mayor fecha) de cada semestre. Útil para ver la evolución a lo largo de varios semestres.
+- **Errores:** 404 si no existe el seguimiento
+
 ---
 
 ## Formato del Excel esperado
@@ -287,8 +440,16 @@ El microservicio es tolerante: si una hoja no tiene el formato esperado la salta
 
 - El campo `carrera` se normaliza a mayúsculas con `str.strip().str.upper()` al parsear, para evitar duplicados por diferencias de capitalización.
 - Las celdas vacías en columnas de asistencia se interpretan como `0` (falta).
-- El porcentaje de asistencia siempre se calcula sobre 60 pts (máximo teórico del semestre).
 - Los promedios en todos los endpoints de stats se redondean a 1 decimal.
 - Todos los endpoints de stats devuelven 404 si el `upload_id` no existe.
 - Para agregar nuevos endpoints de estadísticas: la lógica va en `stats_service.py` y el registro de rutas en `router.py`. No tocar modelos ni schemas existentes salvo que sea necesario.
 - El archivo `CLAUDE.md` en la raíz tiene el contexto técnico del proyecto para usarlo con Claude Code en futuras sesiones.
+
+### Interpretación correcta de ASISTENCIA vs TOTAL (talleres)
+
+Estas son **dos métricas completamente independientes** que nunca se suman:
+
+- **`total_asistencia`** — Suma de puntos de asistencia a las sesiones. Máximo **60 pts** (24 sesiones × 2.5 pts, incluyendo el día de asueto que el Excel contabiliza). El porcentaje se calcula siempre como `(total_asistencia / 60) * 100`.
+- **`total` en BD / `total_talleres` en la API** — Suma de los 5 talleres complementarios: NUTRICIÓN + FISIO + LIMPIEZA + COAE + TALLER. Máximo **40 pts**. El porcentaje se calcula como `(total_talleres / 40) * 100`. **No es una calificación global ni incluye asistencia.**
+- La columna del Excel llamada `TOTAL` corresponde exclusivamente a la suma de talleres. No es `asistencia + talleres`.
+- En `AlumnoOut` el campo se expone como `total_talleres` (renombrado respecto a la columna de BD `total`) para que la semántica sea explícita. Los campos `porcentaje_asistencia` y `porcentaje_talleres` se calculan automáticamente en el schema.

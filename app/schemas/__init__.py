@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------- Upload ----------
@@ -51,10 +51,22 @@ class AlumnoOut(BaseModel):
     limpieza: Optional[Decimal]
     coae: Optional[Decimal]
     taller: Optional[Decimal]
-    total: Optional[Decimal]
+    # 'total' en BD = suma de talleres (máx 40 pts), se expone como total_talleres
+    total_talleres: Optional[Decimal] = Field(None, validation_alias="total")
+    porcentaje_asistencia: Optional[float] = None
+    porcentaje_talleres: Optional[float] = None
 
     class Config:
         from_attributes = True
+        populate_by_name = True
+
+    @model_validator(mode="after")
+    def compute_porcentajes(self):
+        if self.total_asistencia is not None:
+            self.porcentaje_asistencia = round(float(self.total_asistencia) / 60 * 100, 1)
+        if self.total_talleres is not None:
+            self.porcentaje_talleres = round(float(self.total_talleres) / 40 * 100, 1)
+        return self
 
 
 # ---------- Asistencia ----------

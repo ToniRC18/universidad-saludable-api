@@ -71,3 +71,13 @@ class Asistencia(Base):
     valor = Column(Numeric(4, 2), nullable=False, default=0)
 
     alumno = relationship("Alumno", back_populates="asistencias")
+
+
+# Módulo de pruebas físicas
+from app.models.pruebas import (  # noqa: E402,F401
+    Seguimiento,
+    SeguimientoGrupo,
+    PruebaFisica,
+    PeriodoSeguimiento,
+    ResultadoPrueba,
+)
