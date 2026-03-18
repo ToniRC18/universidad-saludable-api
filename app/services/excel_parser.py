@@ -23,13 +23,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Columns to DISCARD (case-insensitive substring match on header name)
+# Album Entregado y Cuestionario se descartan si existen; si no están presentes, no ocurre nada.
 DISCARD_PATTERNS = [
-    r"^$",                  # blank / empty header
+    r"^$",                          # blank / empty header
     r"telefono",
-    r"cuestionario",
-    r"album\s*entregado",
+    r"cuestionario",                # optional column — descartada si existe
+    r"album\s*entregado",           # optional column — descartada si existe
     r"e42",
-    r"asueto",               # catches "17 Marz Asueto" and similar
+    r"inhabil|inh[aá]bil|asueto",   # días inhábiles (cualquier variante con/sin tilde)
 ]
 
 # Columns we ALWAYS want to keep (exact names used in the Excel)
@@ -155,7 +156,8 @@ class ParsedGrupo:
     def __init__(self, nombre: str, horario: str):
         self.nombre = nombre
         self.horario = horario
-        self.alumnos: list[dict] = []   # list of {meta: ..., date_cols: ..., summary: ...}
+        self.max_asistencia: float = 0.0   # sesiones_reales * 2.5, calculado al parsear
+        self.alumnos: list[dict] = []      # list of {meta: ..., dates: ..., summary: ...}
 
 
 def parse_excel(file_bytes: bytes, semestre_label: str = "") -> list[ParsedGrupo]:
@@ -195,27 +197,29 @@ def parse_excel(file_bytes: bytes, semestre_label: str = "") -> list[ParsedGrupo
                 col_map[idx] = "skip"
                 continue
 
+            # Cambio 3: normalizar header con .strip().upper() antes de cualquier comparación
             h_str = str(header).strip()
+            h_upper = h_str.upper()
 
             if _should_discard(h_str):
                 col_map[idx] = "skip"
                 continue
 
-            # Summary columns
-            upper = h_str.upper().replace("Ó", "O").replace("É", "E")
+            # Summary columns — comparar en uppercase normalizando tildes
+            h_norm = h_upper.replace("Ó", "O").replace("É", "E").replace("Á", "A").replace("Í", "I").replace("Ú", "U")
             matched_summary = None
             for sc in SUMMARY_COLS:
-                if sc.upper().replace("Ó", "O").replace("É", "E") == upper:
+                if sc.upper().replace("Ó", "O").replace("É", "E") == h_norm:
                     matched_summary = sc
                     break
             if matched_summary:
                 col_map[idx] = f"summary:{matched_summary}"
                 continue
 
-            # Meta columns
+            # Meta columns — comparar en uppercase (Folio/FOLIO/folio tratados igual)
             matched_meta = None
             for mc in META_COLS:
-                if mc.lower() == h_str.lower():
+                if mc.upper() == h_upper:
                     matched_meta = mc
                     break
             if matched_meta:
@@ -243,7 +247,12 @@ def parse_excel(file_bytes: bytes, semestre_label: str = "") -> list[ParsedGrupo
             )
             continue
 
+        # Cambio 1: max_asistencia dinámico — contar sesiones reales (date cols ya filtradas de inhábiles)
+        date_col_count = sum(1 for v in col_map.values() if v.startswith("date:"))
+        max_asistencia = round(date_col_count * 2.5, 2)
+
         grupo = ParsedGrupo(nombre=sheet_name, horario=horario)
+        grupo.max_asistencia = max_asistencia
 
         for row in data_rows:
             # Skip completely empty rows

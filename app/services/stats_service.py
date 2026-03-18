@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Alumno, Asistencia, Grupo, Upload
 
-MAX_ASISTENCIA = 60.0  # 24 sesiones × 2.5 pts
+MAX_ASISTENCIA_FALLBACK = 60.0  # fallback para grupos sin max_asistencia (datos previos a la migración)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +95,7 @@ def get_asistencia_por_carrera(db: Session, upload_id: int) -> list[AsistenciaPo
             Alumno.carrera,
             func.count(Alumno.id).label("total_alumnos"),
             func.avg(Alumno.total_asistencia).label("promedio"),
+            func.avg(Grupo.max_asistencia).label("avg_max"),
         )
         .join(Grupo, Alumno.grupo_id == Grupo.id)
         .filter(Grupo.upload_id == upload_id, Alumno.carrera.isnot(None))
@@ -106,11 +107,12 @@ def get_asistencia_por_carrera(db: Session, upload_id: int) -> list[AsistenciaPo
     result = []
     for row in rows:
         promedio = round(float(row.promedio or 0), 1)
+        max_asis = float(row.avg_max) if row.avg_max else MAX_ASISTENCIA_FALLBACK
         result.append(AsistenciaPorCarrera(
             carrera=row.carrera,
             total_alumnos=row.total_alumnos,
             promedio_asistencia=promedio,
-            promedio_porcentaje=round((promedio / MAX_ASISTENCIA) * 100, 1),
+            promedio_porcentaje=round((promedio / max_asis) * 100, 1),
         ))
     return result
 
@@ -172,7 +174,7 @@ def get_alumnos_en_riesgo(
     _get_upload_or_404(db, upload_id)
 
     query = (
-        db.query(Alumno, Grupo.nombre.label("grupo_nombre"))
+        db.query(Alumno, Grupo.nombre.label("grupo_nombre"), Grupo.max_asistencia.label("max_asis"))
         .join(Grupo, Alumno.grupo_id == Grupo.id)
         .filter(Grupo.upload_id == upload_id, Alumno.total_asistencia.isnot(None))
     )
@@ -181,9 +183,10 @@ def get_alumnos_en_riesgo(
         query = query.filter(Alumno.grupo_id == grupo_id)
 
     result = []
-    for alumno, grupo_nombre in query.all():
+    for alumno, grupo_nombre, max_asis in query.all():
         asistencia = float(alumno.total_asistencia)
-        porcentaje = round((asistencia / MAX_ASISTENCIA) * 100, 1)
+        max_asis_val = float(max_asis) if max_asis else MAX_ASISTENCIA_FALLBACK
+        porcentaje = round((asistencia / max_asis_val) * 100, 1)
         if porcentaje < umbral:
             result.append(AlumnoEnRiesgo(
                 alumno_id=alumno.id,
@@ -246,6 +249,7 @@ def get_asistencia_por_semestre_alumno(db: Session, upload_id: int) -> list[Asis
             Alumno.semestre,
             func.count(Alumno.id).label("total_alumnos"),
             func.avg(Alumno.total_asistencia).label("promedio"),
+            func.avg(Grupo.max_asistencia).label("avg_max"),
         )
         .join(Grupo, Alumno.grupo_id == Grupo.id)
         .filter(Grupo.upload_id == upload_id, Alumno.semestre.isnot(None))
@@ -257,11 +261,12 @@ def get_asistencia_por_semestre_alumno(db: Session, upload_id: int) -> list[Asis
     result = []
     for row in rows:
         promedio = round(float(row.promedio or 0), 1)
+        max_asis = float(row.avg_max) if row.avg_max else MAX_ASISTENCIA_FALLBACK
         result.append(AsistenciaPorSemestre(
             semestre=row.semestre,
             total_alumnos=row.total_alumnos,
             promedio_asistencia=promedio,
-            promedio_porcentaje=round((promedio / MAX_ASISTENCIA) * 100, 1),
+            promedio_porcentaje=round((promedio / max_asis) * 100, 1),
         ))
     return result
 
@@ -277,12 +282,13 @@ def get_ranking_grupos(db: Session, upload_id: int) -> list[RankingGrupo]:
         db.query(
             Grupo.id,
             Grupo.nombre,
+            Grupo.max_asistencia,
             func.count(Alumno.id).label("total_alumnos"),
             func.avg(Alumno.total_asistencia).label("promedio"),
         )
         .join(Alumno, Alumno.grupo_id == Grupo.id)
         .filter(Grupo.upload_id == upload_id)
-        .group_by(Grupo.id, Grupo.nombre)
+        .group_by(Grupo.id, Grupo.nombre, Grupo.max_asistencia)
         .order_by(func.avg(Alumno.total_asistencia).desc())
         .all()
     )
@@ -290,12 +296,13 @@ def get_ranking_grupos(db: Session, upload_id: int) -> list[RankingGrupo]:
     result = []
     for pos, row in enumerate(rows, start=1):
         promedio = round(float(row.promedio or 0), 1)
+        max_asis = float(row.max_asistencia) if row.max_asistencia else MAX_ASISTENCIA_FALLBACK
         result.append(RankingGrupo(
             grupo_id=row.id,
             grupo=row.nombre,
             total_alumnos=row.total_alumnos,
             promedio_asistencia=promedio,
-            porcentaje=round((promedio / MAX_ASISTENCIA) * 100, 1),
+            porcentaje=round((promedio / max_asis) * 100, 1),
             posicion=pos,
         ))
     return result

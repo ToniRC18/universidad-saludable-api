@@ -29,7 +29,12 @@ def process_upload(
     db.flush()  # get upload.id
 
     for pg in parsed_grupos:
-        grupo = Grupo(upload_id=upload.id, nombre=pg.nombre, horario=pg.horario or None)
+        grupo = Grupo(
+            upload_id=upload.id,
+            nombre=pg.nombre,
+            horario=pg.horario or None,
+            max_asistencia=Decimal(str(pg.max_asistencia)) if pg.max_asistencia else None,
+        )
         db.add(grupo)
         db.flush()  # get grupo.id
 

@@ -35,6 +35,7 @@ class Grupo(Base):
     upload_id = Column(Integer, ForeignKey("uploads.id", ondelete="CASCADE"), nullable=False)
     nombre = Column(String(255), nullable=False)
     horario = Column(Text, nullable=True)
+    max_asistencia = Column(Numeric(6, 2), nullable=True)  # sesiones_reales * 2.5
 
     upload = relationship("Upload", back_populates="grupos")
     alumnos = relationship("Alumno", back_populates="grupo", cascade="all, delete-orphan")
