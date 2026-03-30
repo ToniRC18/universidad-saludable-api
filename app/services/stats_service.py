@@ -92,14 +92,14 @@ def get_asistencia_por_carrera(db: Session, upload_id: int) -> list[AsistenciaPo
 
     rows = (
         db.query(
-            Alumno.carrera,
+            func.upper(func.trim(Alumno.carrera)).label("carrera"),
             func.count(Alumno.id).label("total_alumnos"),
             func.avg(Alumno.total_asistencia).label("promedio"),
             func.avg(Grupo.max_asistencia).label("avg_max"),
         )
         .join(Grupo, Alumno.grupo_id == Grupo.id)
         .filter(Grupo.upload_id == upload_id, Alumno.carrera.isnot(None))
-        .group_by(Alumno.carrera)
+        .group_by(func.upper(func.trim(Alumno.carrera)))
         .order_by(func.avg(Alumno.total_asistencia).desc())
         .all()
     )
@@ -211,7 +211,7 @@ def get_talleres_por_carrera(db: Session, upload_id: int) -> list[TalleresPorCar
 
     rows = (
         db.query(
-            Alumno.carrera,
+            func.upper(func.trim(Alumno.carrera)).label("carrera"),
             func.avg(Alumno.nutricion).label("nutricion"),
             func.avg(Alumno.fisio).label("fisio"),
             func.avg(Alumno.limpieza).label("limpieza"),
@@ -220,7 +220,7 @@ def get_talleres_por_carrera(db: Session, upload_id: int) -> list[TalleresPorCar
         )
         .join(Grupo, Alumno.grupo_id == Grupo.id)
         .filter(Grupo.upload_id == upload_id, Alumno.carrera.isnot(None))
-        .group_by(Alumno.carrera)
+        .group_by(func.upper(func.trim(Alumno.carrera)))
         .all()
     )
 
@@ -246,15 +246,15 @@ def get_asistencia_por_semestre_alumno(db: Session, upload_id: int) -> list[Asis
 
     rows = (
         db.query(
-            Alumno.semestre,
+            func.upper(func.trim(Alumno.semestre)).label("semestre"),
             func.count(Alumno.id).label("total_alumnos"),
             func.avg(Alumno.total_asistencia).label("promedio"),
             func.avg(Grupo.max_asistencia).label("avg_max"),
         )
         .join(Grupo, Alumno.grupo_id == Grupo.id)
         .filter(Grupo.upload_id == upload_id, Alumno.semestre.isnot(None))
-        .group_by(Alumno.semestre)
-        .order_by(Alumno.semestre)
+        .group_by(func.upper(func.trim(Alumno.semestre)))
+        .order_by(func.upper(func.trim(Alumno.semestre)))
         .all()
     )
 

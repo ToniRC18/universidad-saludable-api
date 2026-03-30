@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from datetime import date, datetime
 from typing import Any
 
@@ -69,6 +70,114 @@ MONTH_MAP = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _ascii_key(text: str) -> str:
+    """Return accent-stripped, uppercased key for alias lookups."""
+    nfkc = unicodedata.normalize("NFKC", text.strip())
+    nfd = unicodedata.normalize("NFD", nfkc)
+    return "".join(c for c in nfd if unicodedata.category(c) != "Mn").upper()
+
+
+# Maps accent-stripped uppercase variants → canonical short name (uppercase, with accents).
+_CARRERA_ALIAS: dict[str, str] = {
+    # Enfermería
+    "ENFERMERIA": "ENFERMERÍA",
+    "LICENCIATURA EN ENFERMERIA": "ENFERMERÍA",
+    # Médico Cirujano (absorbe "Medicina")
+    "MEDICINA": "MÉDICO CIRUJANO",
+    "MEDICO CIRUJANO": "MÉDICO CIRUJANO",
+    # Teología
+    "TEOLOGIA": "TEOLOGÍA",
+    "LICENCIATURA EN TEOLOGIA": "TEOLOGÍA",
+    # Psicología Clínica
+    "PSICOLOGIA CLINICA": "PSICOLOGÍA CLÍNICA",
+    "LICENCIATURA EN PSICOLOGIA CLINICA": "PSICOLOGÍA CLÍNICA",
+    # Psicología Educativa
+    "PSICOLOGIA EDUCATIVA": "PSICOLOGÍA EDUCATIVA",
+    "LICENCIATURA EN PSICOLOGIA EDUCATIVA": "PSICOLOGÍA EDUCATIVA",
+    # Químico Clínico Biólogo
+    "QCB": "QUÍMICO CLÍNICO BIÓLOGO",
+    "QUIMICO CLINICO BIOLOGO": "QUÍMICO CLÍNICO BIÓLOGO",
+    "LICENCIATURA EN QUIMICO CLINICO BIOLOGO": "QUÍMICO CLÍNICO BIÓLOGO",
+    # Negocios Internacionales (incluye typo "Negiocios")
+    "NEGIOCIOS": "NEGOCIOS INTERNACIONALES",
+    "NEGOCIOS": "NEGOCIOS INTERNACIONALES",
+    "LICENCIATURA EN NEGOCIOS INTERNACIONALES": "NEGOCIOS INTERNACIONALES",
+    # Terapia Física
+    "TERAPIA FISICA": "TERAPIA FÍSICA",
+    "LICENCIATURA EN TERAPIA FISICA Y REHABILITACION": "TERAPIA FÍSICA",
+    # Artes Visuales
+    "LIC EN ARTES VISUALES": "ARTES VISUALES",
+    "LICENCIATURA EN ARTES VISUALES": "ARTES VISUALES",
+    # Música
+    "MUSICA": "MÚSICA",
+    # Comunicación y Medios
+    "COMUNICACION Y MEDIOS": "COMUNICACIÓN Y MEDIOS",
+    "LICENCIATURA EN COMUNICACION Y MEDIOS": "COMUNICACIÓN Y MEDIOS",
+    # Contaduría Pública
+    "CONTADURIA PUBLICA": "CONTADURÍA PÚBLICA",
+    "LICENCIATURA EN CONTADURIA PUBLICA": "CONTADURÍA PÚBLICA",
+    # Derecho
+    "LICENCIATURA EN DERECHO": "DERECHO",
+    # Arquitectura
+    "LICENCIATURA EN ARQUITECTURA": "ARQUITECTURA",
+    # Diseño de Comunicación Visual
+    "DISENO DE COMUNICACION VISUAL": "DISEÑO DE COMUNICACIÓN VISUAL",
+    "LICENCIATURA EN DISENO DE COMUNICACION VISUAL": "DISEÑO DE COMUNICACIÓN VISUAL",
+    # Nutrición
+    "NUTRICION Y ESTILO DE VIDA": "NUTRICIÓN Y ESTILO DE VIDA",
+    "LICENCIATURA EN NUTRICION Y ESTILO DE VIDA": "NUTRICIÓN Y ESTILO DE VIDA",
+    # Educación Preescolar / Primaria
+    "LICENCIATURA EN EDUCACION PREESCOLAR": "EDUCACIÓN PREESCOLAR",
+    "LICENCIATURA EN EDUCACION PRIMARIA": "EDUCACIÓN PRIMARIA",
+    # Enseñanza (Ciencias Naturales, Sociales, Matemáticas, Inglés)
+    "LICENCIATURA EN ENSENANZA DE LAS CIENCIAS NATURALES": "ENSEÑANZA DE LAS CIENCIAS NATURALES",
+    "LICENCIATURA EN ENSENANZA DE LAS CIENCIAS SOCIALES": "ENSEÑANZA DE LAS CIENCIAS SOCIALES",
+    "EDUCACION SOCIALES": "ENSEÑANZA DE LAS CIENCIAS SOCIALES",
+    "LICENCIATURA EN ENSENANZA DE LAS MATEMATICAS": "ENSEÑANZA DE LAS MATEMÁTICAS",
+    "LICENCIATURA EN ENSENANZA DEL INGLES": "ENSEÑANZA DEL INGLÉS",
+    # Tecnologías de la Información
+    "TECNOLOGIAS DE LA INFORMACION": "TECNOLOGÍAS DE LA INFORMACIÓN",
+    # Ingenierías
+    "INGENIERIA EN SISTEMAS COMPUTACIONALES": "INGENIERÍA EN SISTEMAS COMPUTACIONALES",
+    "INGENIERIA EN SISTEMAS": "INGENIERÍA EN SISTEMAS",
+    "INGENIERIA INDUSTRIAL Y DE SISTEMAS": "INGENIERÍA INDUSTRIAL Y DE SISTEMAS",
+    "INGENIERIA EN ELECTRONICA Y TELECOMUNICACIONES": "INGENIERÍA EN ELECTRÓNICA Y TELECOMUNICACIONES",
+    "INGENIERIA EN GESTION DE TECNOLOGIAS DE LA INFORMACION": "INGENIERÍA EN GESTIÓN DE TECNOLOGÍAS DE LA INFORMACIÓN",
+}
+
+_SEMESTRE_ORDINAL: dict[str, str] = {
+    "1": "1ER", "2": "2DO", "3": "3ER", "4": "4TO",
+    "5": "5TO", "6": "6TO", "7": "7MO", "8": "8VO",
+    "9": "9NO", "10": "10MO",
+}
+
+
+def _normalize_carrera(value: Any) -> str | None:
+    """Normalize career name using alias map, then uppercase fallback."""
+    if value is None:
+        return None
+    text = unicodedata.normalize("NFKC", str(value).strip())
+    if not text or text.lower() == "none":
+        return None
+    canonical = _CARRERA_ALIAS.get(_ascii_key(text))
+    return canonical if canonical else text.upper()
+
+
+def _normalize_semestre(value: Any) -> str | None:
+    """Normalize semester to '4TO SEMESTRE' format."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "none":
+        return None
+    m = re.match(r"^(\d+)", text)
+    if m:
+        num = m.group(1)
+        ordinal = _SEMESTRE_ORDINAL.get(num, f"{num}TO")
+        return f"{ordinal} SEMESTRE"
+    return text.upper()
+
 
 def _should_discard(header: str) -> bool:
     """Return True if this column header should be discarded."""
@@ -274,7 +383,13 @@ def parse_excel(file_bytes: bytes, semestre_label: str = "") -> list[ParsedGrupo
                     continue
                 elif role.startswith("meta:"):
                     key = role[5:]
-                    alumno["meta"][key.lower()] = str(cell_val).strip() if cell_val is not None else None
+                    raw = str(cell_val).strip() if cell_val is not None else None
+                    if key.lower() == "carrera":
+                        alumno["meta"][key.lower()] = _normalize_carrera(raw)
+                    elif key.lower() == "semestre":
+                        alumno["meta"][key.lower()] = _normalize_semestre(raw)
+                    else:
+                        alumno["meta"][key.lower()] = raw
                 elif role.startswith("date:"):
                     iso = role[5:]
                     alumno["dates"][iso] = _to_numeric(cell_val)
