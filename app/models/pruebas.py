@@ -26,6 +26,9 @@ class SeguimientoGrupo(Base):
     seguimiento_id = Column(Integer, ForeignKey("seguimientos.id", ondelete="CASCADE"), nullable=False)
     nombre_grupo = Column(String(255), nullable=False)
     descripcion = Column(Text, nullable=True)
+    # Referencia al grupo de asistencias del que fueron importados los alumnos.
+    # NULL si el grupo fue creado manualmente.
+    upload_grupo_ref_id = Column(Integer, ForeignKey("grupos.id", ondelete="SET NULL"), nullable=True)
 
     seguimiento = relationship("Seguimiento", back_populates="grupos")
     resultados = relationship("ResultadoPrueba", back_populates="grupo", cascade="all, delete-orphan")

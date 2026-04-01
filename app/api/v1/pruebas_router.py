@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.models.pruebas import PeriodoSeguimiento, Seguimiento, SeguimientoGrupo, PruebaFisica
 from app.schemas.pruebas import (
+    ComparacionSeguimientos,
+    EstadisticasPrueba,
     GrupoCreate,
     GrupoOut,
     HistoricoPrueba,
@@ -66,7 +68,9 @@ def actualizar_seguimiento(seguimiento_id: int, body: SeguimientoUpdate, db: Ses
 
 @router.post("/seguimientos/{seguimiento_id}/grupos", response_model=GrupoOut, status_code=201)
 def agregar_grupo(seguimiento_id: int, body: GrupoCreate, db: Session = Depends(get_db)):
-    g = pruebas_service.agregar_grupo(db, seguimiento_id, body.nombre_grupo, body.descripcion)
+    g = pruebas_service.agregar_grupo(
+        db, seguimiento_id, body.nombre_grupo, body.descripcion, body.upload_grupo_ref_id
+    )
     return GrupoOut.model_validate(g)
 
 
@@ -164,3 +168,23 @@ def ranking_mejora(
 @router.get("/seguimientos/{seguimiento_id}/historico", response_model=list[HistoricoPrueba])
 def historico(seguimiento_id: int, db: Session = Depends(get_db)):
     return pruebas_service.get_historico(db, seguimiento_id)
+
+
+@router.get("/seguimientos/{seguimiento_id}/estadisticas", response_model=list[EstadisticasPrueba])
+def estadisticas(
+    seguimiento_id: int,
+    semestre_label: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    return pruebas_service.get_estadisticas(db, seguimiento_id, semestre_label)
+
+
+@router.get("/comparar", response_model=ComparacionSeguimientos)
+def comparar_seguimientos(
+    seg_a: int = Query(..., description="ID del primer seguimiento"),
+    seg_b: int = Query(..., description="ID del segundo seguimiento"),
+    semestre_label: str = Query(...),
+    grupo_nombre: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    return pruebas_service.get_comparacion(db, seg_a, seg_b, semestre_label, grupo_nombre)

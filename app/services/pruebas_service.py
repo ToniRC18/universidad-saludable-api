@@ -12,9 +12,16 @@ from app.models.pruebas import (
     SeguimientoGrupo,
 )
 from app.schemas.pruebas import (
+    ComparacionPruebaItem,
+    ComparacionSeguimientos,
+    EstadisticasGrupo,
+    EstadisticasPeriodo,
+    EstadisticasPrueba,
     GrupoOut,
     HistoricoPrueba,
     HistoricoSemestre,
+    InfoSeguimiento,
+    MejoraInfo,
     PeriodoOut,
     ProgresoAlumno,
     ProgresoXPrueba,
@@ -108,9 +115,20 @@ def actualizar_seguimiento(
 # Grupos del seguimiento
 # ---------------------------------------------------------------------------
 
-def agregar_grupo(db: Session, seguimiento_id: int, nombre_grupo: str, descripcion: Optional[str]) -> SeguimientoGrupo:
+def agregar_grupo(
+    db: Session,
+    seguimiento_id: int,
+    nombre_grupo: str,
+    descripcion: Optional[str],
+    upload_grupo_ref_id: Optional[int] = None,
+) -> SeguimientoGrupo:
     _get_or_404(db, Seguimiento, seguimiento_id, "Seguimiento")
-    g = SeguimientoGrupo(seguimiento_id=seguimiento_id, nombre_grupo=nombre_grupo, descripcion=descripcion)
+    g = SeguimientoGrupo(
+        seguimiento_id=seguimiento_id,
+        nombre_grupo=nombre_grupo,
+        descripcion=descripcion,
+        upload_grupo_ref_id=upload_grupo_ref_id,
+    )
     db.add(g)
     db.commit()
     db.refresh(g)
@@ -365,6 +383,277 @@ def get_ranking_mejora(
     # ordenar por diferencia desc (mayor mejora primero), nulls al final
     result.sort(key=lambda x: (x.diferencia is None, -(x.diferencia or 0)))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Análisis — Estadísticas detalladas por periodo
+# ---------------------------------------------------------------------------
+
+def get_estadisticas(
+    db: Session,
+    seguimiento_id: int,
+    semestre_label: str,
+) -> list[EstadisticasPrueba]:
+    """
+    Para cada prueba del seguimiento devuelve, por periodo, las estadísticas
+    descriptivas globales (todos los grupos) y desglosadas por grupo.
+    """
+    _get_or_404(db, Seguimiento, seguimiento_id, "Seguimiento")
+
+    periodos = (
+        db.query(PeriodoSeguimiento)
+        .filter(
+            PeriodoSeguimiento.seguimiento_id == seguimiento_id,
+            PeriodoSeguimiento.semestre_label == semestre_label,
+        )
+        .order_by(PeriodoSeguimiento.fecha)
+        .all()
+    )
+    if not periodos:
+        return []
+
+    pruebas = (
+        db.query(PruebaFisica)
+        .filter(PruebaFisica.seguimiento_id == seguimiento_id)
+        .order_by(PruebaFisica.id)
+        .all()
+    )
+    grupos = (
+        db.query(SeguimientoGrupo)
+        .filter(SeguimientoGrupo.seguimiento_id == seguimiento_id)
+        .all()
+    )
+    periodo_ids = [p.id for p in periodos]
+
+    result: list[EstadisticasPrueba] = []
+
+    for prueba in pruebas:
+        # ── estadísticas globales (todos los grupos) ──────────────────────
+        global_periodos: list[EstadisticasPeriodo] = []
+        for periodo in periodos:
+            stats = _stats_for(db, prueba.id, periodo.id, grupo_id=None)
+            global_periodos.append(EstadisticasPeriodo(
+                periodo_id=periodo.id,
+                nombre_periodo=periodo.nombre_periodo,
+                fecha=periodo.fecha,
+                **stats,
+            ))
+
+        # ── estadísticas por grupo ────────────────────────────────────────
+        grupos_out: list[EstadisticasGrupo] = []
+        for grupo in grupos:
+            g_periodos: list[EstadisticasPeriodo] = []
+            for periodo in periodos:
+                stats = _stats_for(db, prueba.id, periodo.id, grupo_id=grupo.id)
+                g_periodos.append(EstadisticasPeriodo(
+                    periodo_id=periodo.id,
+                    nombre_periodo=periodo.nombre_periodo,
+                    fecha=periodo.fecha,
+                    **stats,
+                ))
+
+            # mejora: último promedio con dato − primer promedio con dato
+            promedios = [p.promedio for p in g_periodos if p.promedio is not None]
+            mejora_abs = mejora_pct = None
+            if len(promedios) >= 2:
+                mejora_abs = round(promedios[-1] - promedios[0], 2)
+                if promedios[0] != 0:
+                    mejora_pct = round((mejora_abs / abs(promedios[0])) * 100, 1)
+
+            grupos_out.append(EstadisticasGrupo(
+                grupo_id=grupo.id,
+                grupo=grupo.nombre_grupo,
+                periodos=g_periodos,
+                mejora_abs=mejora_abs,
+                mejora_pct=mejora_pct,
+            ))
+
+        result.append(EstadisticasPrueba(
+            prueba_id=prueba.id,
+            prueba=prueba.nombre,
+            unidad=prueba.unidad,
+            mayor_es_mejor=prueba.mayor_es_mejor,
+            global_periodos=global_periodos,
+            grupos=grupos_out,
+        ))
+
+    return result
+
+
+def _stats_for(db: Session, prueba_id: int, periodo_id: int, grupo_id: Optional[int]) -> dict:
+    """Devuelve n, promedio, mediana, desv_std, minimo, maximo para un periodo/grupo."""
+    q = db.query(ResultadoPrueba).filter(
+        ResultadoPrueba.prueba_id == prueba_id,
+        ResultadoPrueba.periodo_id == periodo_id,
+        ResultadoPrueba.valor.isnot(None),
+    )
+    if grupo_id is not None:
+        q = q.filter(ResultadoPrueba.grupo_id == grupo_id)
+
+    filas = q.all()
+    valores = [float(r.valor) for r in filas if r.valor is not None]
+    n = len(valores)
+
+    if n == 0:
+        return dict(n=0, promedio=None, mediana=None, desv_std=None, minimo=None, maximo=None)
+
+    promedio = round(sum(valores) / n, 2)
+    sorted_v = sorted(valores)
+    mid = n // 2
+    mediana = round(
+        sorted_v[mid] if n % 2 == 1 else (sorted_v[mid - 1] + sorted_v[mid]) / 2, 2
+    )
+    variance = sum((v - promedio) ** 2 for v in valores) / n
+    desv_std = round(variance ** 0.5, 2)
+
+    return dict(
+        n=n,
+        promedio=promedio,
+        mediana=mediana,
+        desv_std=desv_std,
+        minimo=round(min(valores), 2),
+        maximo=round(max(valores), 2),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Análisis — Comparación entre dos seguimientos
+# ---------------------------------------------------------------------------
+
+def get_comparacion(
+    db: Session,
+    seg_a_id: int,
+    seg_b_id: int,
+    semestre_label: str,
+    grupo_nombre: str,
+) -> ComparacionSeguimientos:
+    """
+    Compara los resultados de dos seguimientos para el mismo grupo de alumnos
+    y semestre.  Pruebas con el mismo nombre en ambos seguimientos se comparan
+    directamente; el resto se incluye sin contraparte.
+    """
+    seg_a = _get_or_404(db, Seguimiento, seg_a_id, "Seguimiento A")
+    seg_b = _get_or_404(db, Seguimiento, seg_b_id, "Seguimiento B")
+
+    pruebas_list: list[ComparacionPruebaItem] = []
+
+    # índice de pruebas de B por nombre (lower)
+    pruebas_b_idx = {
+        p.nombre.strip().lower(): p
+        for p in db.query(PruebaFisica)
+        .filter(PruebaFisica.seguimiento_id == seg_b_id)
+        .all()
+    }
+
+    pruebas_a = (
+        db.query(PruebaFisica)
+        .filter(PruebaFisica.seguimiento_id == seg_a_id)
+        .order_by(PruebaFisica.id)
+        .all()
+    )
+
+    for prueba_a in pruebas_a:
+        prueba_b = pruebas_b_idx.get(prueba_a.nombre.strip().lower())
+        if prueba_b is None:
+            continue  # sin contraparte — no se puede comparar
+
+        mejora_a = _mejora_seguimiento(db, seg_a_id, prueba_a.id, semestre_label, grupo_nombre)
+        mejora_b = _mejora_seguimiento(db, seg_b_id, prueba_b.id, semestre_label, grupo_nombre)
+
+        ganador = _determinar_ganador(mejora_a, mejora_b, prueba_a.mayor_es_mejor)
+
+        pruebas_list.append(ComparacionPruebaItem(
+            prueba=prueba_a.nombre,
+            unidad=prueba_a.unidad,
+            mayor_es_mejor=prueba_a.mayor_es_mejor,
+            resultado_a=mejora_a,
+            resultado_b=mejora_b,
+            ganador=ganador,
+        ))
+
+    return ComparacionSeguimientos(
+        seguimiento_a=InfoSeguimiento(id=seg_a.id, nombre=seg_a.nombre),
+        seguimiento_b=InfoSeguimiento(id=seg_b.id, nombre=seg_b.nombre),
+        grupo=grupo_nombre,
+        semestre_label=semestre_label,
+        pruebas=pruebas_list,
+    )
+
+
+def _mejora_seguimiento(
+    db: Session,
+    seguimiento_id: int,
+    prueba_id: int,
+    semestre_label: str,
+    grupo_nombre: str,
+) -> MejoraInfo:
+    """Calcula mejora (inicial → final) para una prueba/grupo/semestre en un seguimiento."""
+    grupo = (
+        db.query(SeguimientoGrupo)
+        .filter(
+            SeguimientoGrupo.seguimiento_id == seguimiento_id,
+            SeguimientoGrupo.nombre_grupo.ilike(grupo_nombre.strip()),
+        )
+        .first()
+    )
+    grupo_id = grupo.id if grupo else None
+
+    periodos = (
+        db.query(PeriodoSeguimiento)
+        .filter(
+            PeriodoSeguimiento.seguimiento_id == seguimiento_id,
+            PeriodoSeguimiento.semestre_label == semestre_label,
+        )
+        .order_by(PeriodoSeguimiento.fecha)
+        .all()
+    )
+
+    if len(periodos) < 2:
+        return MejoraInfo(
+            n_inicial=0, n_final=0,
+            promedio_inicial=None, promedio_final=None,
+            mejora_abs=None, mejora_pct=None,
+        )
+
+    s_inicial = _stats_for(db, prueba_id, periodos[0].id, grupo_id)
+    s_final   = _stats_for(db, prueba_id, periodos[-1].id, grupo_id)
+
+    prom_ini = s_inicial["promedio"]
+    prom_fin = s_final["promedio"]
+    mejora_abs = mejora_pct = None
+    if prom_ini is not None and prom_fin is not None:
+        mejora_abs = round(prom_fin - prom_ini, 2)
+        if prom_ini != 0:
+            mejora_pct = round((mejora_abs / abs(prom_ini)) * 100, 1)
+
+    return MejoraInfo(
+        n_inicial=s_inicial["n"],
+        n_final=s_final["n"],
+        promedio_inicial=prom_ini,
+        promedio_final=prom_fin,
+        mejora_abs=mejora_abs,
+        mejora_pct=mejora_pct,
+    )
+
+
+def _determinar_ganador(a: MejoraInfo, b: MejoraInfo, mayor_es_mejor: bool) -> Optional[str]:
+    """Determina qué seguimiento produjo mejor mejora."""
+    if a.mejora_pct is None and b.mejora_pct is None:
+        return None
+    if a.mejora_pct is None:
+        return "B"
+    if b.mejora_pct is None:
+        return "A"
+
+    # Si mayor_es_mejor, queremos mayor mejora_pct; si no, también (mejora_pct ya
+    # se calcula como (final-inicial)/|inicial| — si menor es mejor y bajó, da negativo,
+    # lo que en realidad es bueno; invertimos el signo para comparar)
+    pct_a = a.mejora_pct if mayor_es_mejor else -a.mejora_pct
+    pct_b = b.mejora_pct if mayor_es_mejor else -b.mejora_pct
+
+    if abs(pct_a - pct_b) < 0.5:
+        return "empate"
+    return "A" if pct_a > pct_b else "B"
 
 
 # ---------------------------------------------------------------------------

@@ -6,14 +6,18 @@ from io import BytesIO
 from typing import Optional
 
 import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.pruebas import PeriodoSeguimiento, PruebaFisica, ResultadoPrueba, SeguimientoGrupo
+from app.models import Grupo, Alumno, Upload
 
 logger = logging.getLogger(__name__)
 
-FIXED_COLS = ["Matricula", "Nombre", "Genero", "Edad"]
+FIXED_COLS = ["Matricula", "Nombre"]
+
+EMPTY_ROWS_FALLBACK = 30
 
 
 # ---------------------------------------------------------------------------
@@ -36,30 +40,78 @@ def generar_plantilla(db: Session, periodo_id: int) -> bytes:
         )
 
     wb = openpyxl.Workbook()
-    wb.remove(wb.active)  # quitar hoja vacía por defecto
+    wb.remove(wb.active)
+
+    header_fill = PatternFill(start_color="2D2D2D", end_color="2D2D2D", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True, size=10)
+    meta_font   = Font(italic=True, color="888888", size=9)
 
     for grupo in grupos:
-        ws = wb.create_sheet(title=grupo.nombre_grupo[:31])  # máx 31 chars en Excel
+        ws = wb.create_sheet(title=grupo.nombre_grupo[:31])
 
-        # Fila 0 — metadatos
+        # ── Fila 0: metadatos ────────────────────────────────────────────
         ws.append([
             seguimiento.nombre,
             periodo.nombre_periodo,
             str(periodo.fecha),
             periodo.semestre_label,
         ])
+        for cell in ws[1]:
+            cell.font = meta_font
 
-        # Fila 1 — encabezados
+        # ── Fila 1: encabezados ──────────────────────────────────────────
         headers = FIXED_COLS + [p.nombre for p in pruebas]
         ws.append(headers)
+        for cell in ws[2]:
+            cell.font      = header_font
+            cell.fill      = header_fill
+            cell.alignment = Alignment(horizontal="center")
 
-        # Filas de datos — vacías para que el encargado las llene
-        for _ in range(30):
-            ws.append([""] * len(headers))
+        ws.column_dimensions["A"].width = 16  # Matricula
+        ws.column_dimensions["B"].width = 32  # Nombre
+        for i, _ in enumerate(pruebas, start=3):
+            col_letter = openpyxl.utils.get_column_letter(i)
+            ws.column_dimensions[col_letter].width = 14
+
+        # ── Filas de datos ───────────────────────────────────────────────
+        alumnos = _alumnos_del_grupo(db, grupo)
+
+        if alumnos:
+            for alumno in alumnos:
+                ws.append([alumno.matricula or "", alumno.nombre or ""] + [""] * len(pruebas))
+        else:
+            logger.info(
+                "Grupo '%s' sin alumnos vinculados — plantilla con %d filas vacías.",
+                grupo.nombre_grupo, EMPTY_ROWS_FALLBACK,
+            )
+            for _ in range(EMPTY_ROWS_FALLBACK):
+                ws.append([""] * len(headers))
 
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Alumnos del grupo
+# ---------------------------------------------------------------------------
+
+def _alumnos_del_grupo(db: Session, grupo: SeguimientoGrupo) -> list[Alumno]:
+    """
+    Devuelve los alumnos asignados al grupo del seguimiento.
+    Si el grupo fue importado desde una carga (upload_grupo_ref_id != None),
+    trae exactamente los alumnos de ese grupo de asistencias.
+    Si fue creado manualmente, devuelve lista vacía (filas vacías en plantilla).
+    """
+    if grupo.upload_grupo_ref_id is None:
+        return []
+
+    return (
+        db.query(Alumno)
+        .filter(Alumno.grupo_id == grupo.upload_grupo_ref_id)
+        .order_by(Alumno.nombre)
+        .all()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +175,6 @@ def parsear_resultados(
             logger.warning("Hoja '%s' no tiene columnas Matricula/Nombre — ignorada.", sheet_name)
             continue
 
-        idx_genero = header_row.index("Genero") if "Genero" in header_row else None
-        idx_edad = header_row.index("Edad") if "Edad" in header_row else None
-
         # Filas de datos (a partir de fila 2, índice 2)
         for row_idx, row in enumerate(rows[2:], start=3):
             total_procesadas += 1
@@ -137,8 +186,6 @@ def parsear_resultados(
                 continue
 
             nombre_alumno = _str_val(row, idx_nombre)
-            genero = _str_val(row, idx_genero) if idx_genero is not None else None
-            edad = _int_val(row, idx_edad) if idx_edad is not None else None
 
             for col_idx, prueba in col_prueba.items():
                 valor = _numeric_val(row, col_idx)
@@ -149,8 +196,6 @@ def parsear_resultados(
                     grupo_id=grupo.id,
                     matricula=matricula,
                     nombre_alumno=nombre_alumno,
-                    genero=genero,
-                    edad=edad,
                     valor=valor,
                 )
                 db.add(resultado)
