@@ -18,6 +18,28 @@ from openpyxl.utils import get_column_letter
 
 logger = logging.getLogger(__name__)
 
+def leer_meta(wb: openpyxl.Workbook) -> dict:
+    """Busca la hoja _meta en el workbook y extrae semestre_id e horario_id."""
+    if "_meta" not in wb.sheetnames:
+        return {"semestre_id": 0, "horario_id": 0}  # Regresar 0 para históricos, no crashear
+    
+    ws = wb["_meta"]
+    meta_data = {}
+    for row in ws.iter_rows(values_only=True):
+        if len(row) >= 2 and row[0] is not None:
+            key = str(row[0]).strip()
+            val = row[1]
+            meta_data[key] = val
+            
+    try:
+        semestre_id = int(meta_data.get("semestre_id"))
+        horario_id = int(meta_data.get("horario_id"))
+    except (TypeError, ValueError):
+        raise ValueError("El archivo no es una plantilla válida del sistema. Descarga la plantilla desde el módulo de semestres.")
+        
+    return {"semestre_id": semestre_id, "horario_id": horario_id}
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -70,9 +92,23 @@ MONTH_MAP = {
 # Helpers
 # ---------------------------------------------------------------------------
 
+import unicodedata
+
+def _normalizar(s):
+    """Normaliza texto removiendo espacios, pasando a minúsculas, quitando tildes y normalizando unicode."""
+    if s is None:
+        return ""
+    # Normalización unicode para manejar acentos compuestos (e.g. i + ´ vs í)
+    s = unicodedata.normalize('NFKD', str(s))
+    return (s.strip().lower()
+            .replace("á","a").replace("é","e")
+            .replace("í","i").replace("ó","o").replace("ú","u")
+            .replace("\u0301", "")) # Eliminar diacríticos residuales de NFKD
+
+
 def _should_discard(header: str) -> bool:
     """Return True if this column header should be discarded."""
-    h = str(header).strip()
+    h = _normalizar(header)
     for pattern in DISCARD_PATTERNS:
         if re.search(pattern, h, re.IGNORECASE):
             return True
@@ -91,6 +127,15 @@ def _normalize_date(value: Any, year_hint: int = datetime.now().year) -> date | 
     if value is None:
         return None
 
+    # NUEVO: formato DD/MM/YYYY (plantillas nuevas)
+    if isinstance(value, str) and '/' in value:
+        parts = value.strip().split('/')
+        if len(parts) == 3:
+            try:
+                return date(int(parts[2]), int(parts[1]), int(parts[0]))
+            except:
+                pass
+
     if isinstance(value, datetime):
         return value.date()
 
@@ -103,19 +148,21 @@ def _normalize_date(value: Any, year_hint: int = datetime.now().year) -> date | 
 
     # ISO format
     try:
-        return date.fromisoformat(text[:10])
+        if '-' in text and len(text) >= 10:
+            return date.fromisoformat(text[:10])
     except ValueError:
         pass
 
-    # "DD/MM" or "DD/MM/YYYY"
+    # "DD/MM" or "DD/MM/YYYY" (plantillas nuevas y manuales)
     slash_match = re.match(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", text)
     if slash_match:
         d, m, y = slash_match.groups()
         y = int(y) if y else year_hint
-        if y < 100:
-            y += 2000
         try:
-            return date(y, int(m), int(d))
+            d_int, m_int, y_int = int(d), int(m), int(y)
+            if y_int < 100:
+                y_int += 2000
+            return date(y_int, m_int, d_int)
         except ValueError:
             pass
 
@@ -130,7 +177,12 @@ def _normalize_date(value: Any, year_hint: int = datetime.now().year) -> date | 
             except ValueError:
                 pass
 
-    logger.warning("Could not parse date value: %r", value)
+    # No loguear warning para headers conocidos que no son fechas (Nombre, Matrícula, etc)
+    h_norm = _normalizar(value)
+    if h_norm in ["nombre", "matricula", "carrera", "folio", "semestre"]:
+        return None
+        
+    # logger.debug("Could not parse date value: %r", value) # Silenciamos totalmente para evitar ruido
     return None
 
 
@@ -148,6 +200,9 @@ def _is_date_column(header: str) -> bool:
     return False
 
 
+# (Helper removed, logic moved inside parse_excel loop as per request)
+
+
 # ---------------------------------------------------------------------------
 # Main parser
 # ---------------------------------------------------------------------------
@@ -158,6 +213,10 @@ class ParsedGrupo:
         self.horario = horario
         self.max_asistencia: float = 0.0   # sesiones_reales * 2.5, calculado al parsear
         self.alumnos: list[dict] = []      # list of {meta: ..., dates: ..., summary: ...}
+
+
+# System sheets to skip
+SKIP_SHEETS = {"_catalogo", "_meta"}
 
 
 def parse_excel(file_bytes: bytes, semestre_label: str = "") -> list[ParsedGrupo]:
@@ -171,22 +230,36 @@ def parse_excel(file_bytes: bytes, semestre_label: str = "") -> list[ParsedGrupo
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
+        if ws.title in SKIP_SHEETS:
+            continue
+            
+        # Detectar formato por fila (Cambio 1) - USAR _normalizar para robustez
+        fila1_col1 = _normalizar(ws.cell(row=1, column=1).value)
+        fila2_col1 = _normalizar(ws.cell(row=2, column=1).value)
+
+        if fila2_col1 in ("nombre", "name", "folio"):
+            header_row_idx = 1  # 0-indexed para list(rows)
+            data_start_row_idx = 2
+            horario_row_idx = 0
+        elif fila1_col1 in ("nombre", "name", "folio"):
+            header_row_idx = 0
+            data_start_row_idx = 1
+            horario_row_idx = -1
+        else:
+            logger.warning(f"Sheet '{ws.title}' no tiene headers reconocibles en Col 1 (Fila 1: {repr(fila1_col1)}, Fila 2: {repr(fila2_col1)}) — skipping.")
+            continue
+
         rows = list(ws.iter_rows(values_only=True))
-
-        if len(rows) < 2:
-            logger.warning("Sheet '%s' has fewer than 2 rows — skipping.", sheet_name)
+        if header_row_idx >= len(rows):
             continue
 
-        horario_row = rows[0]   # Row 0: visual header
-        header_row = rows[1]    # Row 1: real column names
-        data_rows = rows[2:]    # Rows 2+: students
-
-        if not any(header_row):
-            logger.warning("Sheet '%s' has empty header row — skipping.", sheet_name)
-            continue
-
-        # Extract horario text (first non-None cell in row 0)
-        horario = next((str(c) for c in horario_row if c is not None), "")
+        header_row = rows[header_row_idx]    # Real column names
+        data_rows = rows[data_start_row_idx:] # Students
+        
+        # Extract horario text
+        horario = ""
+        if horario_row_idx != -1 and horario_row_idx < len(rows):
+            horario = next((str(c) for c in rows[horario_row_idx] if c is not None), "")
 
         # Build column index map
         col_map: dict[int, str] = {}      # col_index → role ("meta:<name>", "date:<isodate>", "summary:<name>", "skip")
@@ -197,29 +270,27 @@ def parse_excel(file_bytes: bytes, semestre_label: str = "") -> list[ParsedGrupo
                 col_map[idx] = "skip"
                 continue
 
-            # Cambio 3: normalizar header con .strip().upper() antes de cualquier comparación
-            h_str = str(header).strip()
-            h_upper = h_str.upper()
+            # Cambio 3: normalizar header
+            h_norm = _normalizar(header)
 
-            if _should_discard(h_str):
+            if _should_discard(header):
                 col_map[idx] = "skip"
                 continue
 
-            # Summary columns — comparar en uppercase normalizando tildes
-            h_norm = h_upper.replace("Ó", "O").replace("É", "E").replace("Á", "A").replace("Í", "I").replace("Ú", "U")
+            # Summary columns — comparar normalizando
             matched_summary = None
             for sc in SUMMARY_COLS:
-                if sc.upper().replace("Ó", "O").replace("É", "E") == h_norm:
+                if _normalizar(sc) == h_norm:
                     matched_summary = sc
                     break
             if matched_summary:
                 col_map[idx] = f"summary:{matched_summary}"
                 continue
 
-            # Meta columns — comparar en uppercase (Folio/FOLIO/folio tratados igual)
+            # Meta columns — comparar normalizando
             matched_meta = None
             for mc in META_COLS:
-                if mc.upper() == h_upper:
+                if _normalizar(mc) == h_norm:
                     matched_meta = mc
                     break
             if matched_meta:
@@ -233,7 +304,7 @@ def parse_excel(file_bytes: bytes, semestre_label: str = "") -> list[ParsedGrupo
                 continue
 
             # Unknown column → skip
-            logger.debug("Sheet '%s', col %d ('%s') not recognized — skipping.", sheet_name, idx, h_str)
+            logger.debug("Sheet '%s', col %d ('%s') not recognized — skipping.", sheet_name, idx, str(header))
             col_map[idx] = "skip"
 
         # Validate we have at least some useful columns

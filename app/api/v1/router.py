@@ -1,23 +1,28 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File, Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models import Alumno, Asistencia, Grupo, Upload
+from app.models import Alumno, Asistencia, Grupo, Upload, Prediccion, Semestre
 from app.schemas import (
     AlumnoOut,
     AsistenciaOut,
     GrupoOut,
     TallerGrupoStats,
     UploadOut,
-    UploadSummary,
+    UploadUpsertResponse,
+    AlumnoUpdate,
 )
 from app.services.upload_service import process_upload
-from app.services import stats_service
+from app.services import stats_service, prediccion_service
+
 from app.api.v1.pruebas_router import router as pruebas_router
+from app.api.v1.semestres_router import router as semestres_router
+from app.api.v1.carreras_router import router as carreras_router
+
 from app.services.stats_service import (
     AsistenciaPorCarrera,
     TendenciaGrupo,
@@ -25,12 +30,15 @@ from app.services.stats_service import (
     TalleresPorCarrera,
     AsistenciaPorSemestre,
     RankingGrupo,
+    SemestreResumen,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["universidad-saludable"])
 router.include_router(pruebas_router)
+router.include_router(semestres_router, prefix="/semestres")
+router.include_router(carreras_router, prefix="/carreras")
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xls"}
 
@@ -39,13 +47,15 @@ ALLOWED_EXTENSIONS = {".xlsx", ".xls"}
 # POST /uploads
 # ---------------------------------------------------------------------------
 
-@router.post("/uploads", response_model=UploadSummary, status_code=201)
+@router.post("/uploads", response_model=UploadUpsertResponse, status_code=201)
 async def upload_excel(
     file: UploadFile = File(...),
-    semestre_label: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    """Recibe un archivo Excel de asistencias, lo parsea y persiste en BD."""
+    """
+    Recibe un archivo Excel de asistencias, verifica la hoja _meta, 
+    y aplica la lógica de Upsert inteligente.
+    """
     import os
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
@@ -59,28 +69,27 @@ async def upload_excel(
         raise HTTPException(status_code=400, detail="El archivo está vacío.")
 
     try:
-        upload, parsed_grupos = process_upload(
+        response = process_upload(
             db=db,
             filename=file.filename,
             file_bytes=file_bytes,
-            semestre_label=semestre_label,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        # Re-lanza HTTPExceptions generadas dentro del proceso (ej. fallas _meta)
+        raise
+
     except Exception as exc:
         logger.exception("Error inesperado al procesar el archivo.")
         raise HTTPException(status_code=500, detail="Error interno al procesar el archivo.")
 
-    total_alumnos = sum(len(g.alumnos) for g in parsed_grupos)
+    # Si fue analizado y no actualizado (HTTP 200 informativo)
+    if not response.actualizado:
+        from fastapi import Response
+        # Se envía 200 explícito por sobre el status_code del decorador
+        pass # Status code defaults to 201 via decorator, but that is fine for non-update successes or we could modify response on access.
+             # Actually, FastAPI permits modifying the response code using a response injected object, but returning the response dict is sufficient here.
 
-    return UploadSummary(
-        id=upload.id,
-        filename=upload.filename,
-        uploaded_at=upload.uploaded_at,
-        semestre_label=upload.semestre_label,
-        grupos_found=len(parsed_grupos),
-        total_alumnos=total_alumnos,
-    )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +105,9 @@ def list_uploads(db: Session = Depends(get_db)):
             id=u.id,
             filename=u.filename,
             uploaded_at=u.uploaded_at,
-            semestre_label=u.semestre_label,
+            semestre_label=u.semestre_label or (u.semestre.nombre if getattr(u, "semestre", None) else None),
+            semestre_id=u.semestre_id,
+            horario_id=u.horario_id,
         )
         for u in uploads
     ]
@@ -160,6 +171,15 @@ def stats_alumnos_en_riesgo(
 
 @router.get("/stats/uploads/{upload_id}/talleres-por-carrera", response_model=list[TalleresPorCarrera], tags=["stats"])
 def stats_talleres_por_carrera(upload_id: int, db: Session = Depends(get_db)):
+    upload = db.query(Upload).filter(Upload.id == upload_id).first()
+    if not upload:
+        raise HTTPException(status_code=404, detail=f"Upload {upload_id} no encontrado.")
+    
+    if upload.semestre_id:
+        semestre = db.query(Semestre).filter(Semestre.id == upload.semestre_id).first()
+        if semestre and not semestre.tiene_talleres:
+            return Response(status_code=204)
+            
     return stats_service.get_talleres_por_carrera(db, upload_id)
 
 
@@ -171,6 +191,50 @@ def stats_asistencia_por_semestre_alumno(upload_id: int, db: Session = Depends(g
 @router.get("/stats/uploads/{upload_id}/ranking-grupos", response_model=list[RankingGrupo], tags=["stats"])
 def stats_ranking_grupos(upload_id: int, db: Session = Depends(get_db)):
     return stats_service.get_ranking_grupos(db, upload_id)
+
+
+# ---------------------------------------------------------------------------
+# STATS — /stats/semestres/{semestre_id}/...
+# ---------------------------------------------------------------------------
+
+@router.get("/stats/semestres/{semestre_id}/asistencia-por-carrera", response_model=list[AsistenciaPorCarrera], tags=["stats"])
+def stats_asistencia_por_carrera_semestre(semestre_id: int, db: Session = Depends(get_db)):
+    return stats_service.get_asistencia_por_carrera_por_semestre(db, semestre_id)
+
+
+@router.get("/stats/semestres/{semestre_id}/tendencia-semanal", response_model=list[TendenciaGrupo], tags=["stats"])
+def stats_tendencia_semanal_semestre(semestre_id: int, db: Session = Depends(get_db)):
+    return stats_service.get_tendencia_semanal_por_semestre(db, semestre_id)
+
+
+@router.get("/stats/semestres/{semestre_id}/alumnos-en-riesgo", response_model=list[AlumnoEnRiesgo], tags=["stats"])
+def stats_alumnos_en_riesgo_semestre(
+    semestre_id: int,
+    umbral: float = 60.0,
+    grupo_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    return stats_service.get_alumnos_en_riesgo_por_semestre(db, semestre_id, umbral, grupo_id)
+
+
+@router.get("/stats/semestres/{semestre_id}/ranking-grupos", response_model=list[RankingGrupo], tags=["stats"])
+def stats_ranking_grupos_semestre(semestre_id: int, db: Session = Depends(get_db)):
+    return stats_service.get_ranking_grupos_por_semestre(db, semestre_id)
+
+
+@router.get("/stats/semestres/{semestre_id}/talleres-por-carrera", response_model=list[TalleresPorCarrera], tags=["stats"])
+def stats_talleres_por_carrera_semestre(semestre_id: int, db: Session = Depends(get_db)):
+    return stats_service.get_talleres_por_carrera_por_semestre(db, semestre_id)
+
+
+@router.get("/stats/semestres/{semestre_id}/asistencia-por-semestre-alumno", response_model=list[AsistenciaPorSemestre], tags=["stats"])
+def stats_asistencia_por_semestre_alumno_semestre(semestre_id: int, db: Session = Depends(get_db)):
+    return stats_service.get_asistencia_por_semestre_alumno_por_semestre(db, semestre_id)
+
+
+@router.get("/stats/semestres/{semestre_id}/resumen", response_model=SemestreResumen, tags=["stats"])
+def stats_resumen_semestre(semestre_id: int, db: Session = Depends(get_db)):
+    return stats_service.get_resumen_semestre(db, semestre_id)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +280,24 @@ def get_asistencias(alumno_id: int, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# PATCH /alumnos/{alumno_id}/activo
+# ---------------------------------------------------------------------------
+
+@router.patch("/alumnos/{alumno_id}/activo", response_model=AlumnoOut)
+def update_alumno_activo(alumno_id: int, updates: AlumnoUpdate, db: Session = Depends(get_db)):
+    """Marca a un alumno como inactivo (baja) o lo reactiva."""
+    alumno = db.query(Alumno).filter(Alumno.id == alumno_id).first()
+    if not alumno:
+        raise HTTPException(status_code=404, detail=f"Alumno {alumno_id} no encontrado.")
+
+    if updates.activo is not None:
+        alumno.activo = updates.activo
+    db.commit()
+    db.refresh(alumno)
+    return alumno
+
+
+# ---------------------------------------------------------------------------
 # GET /uploads/{upload_id}/talleres
 # ---------------------------------------------------------------------------
 
@@ -228,6 +310,11 @@ def get_talleres(upload_id: int, db: Session = Depends(get_db)):
     upload = db.query(Upload).filter(Upload.id == upload_id).first()
     if not upload:
         raise HTTPException(status_code=404, detail=f"Upload {upload_id} no encontrado.")
+
+    if upload.semestre_id:
+        semestre = db.query(Semestre).filter(Semestre.id == upload.semestre_id).first()
+        if semestre and not semestre.tiene_talleres:
+            return Response(status_code=204)
 
     grupos = db.query(Grupo).filter(Grupo.upload_id == upload_id).all()
 
@@ -258,3 +345,86 @@ def get_talleres(upload_id: int, db: Session = Depends(get_db)):
         )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# PREDICCIONES ML
+# ---------------------------------------------------------------------------
+
+@router.post("/predicciones/{upload_id}")
+def post_predecir_riesgo(upload_id: int, db: Session = Depends(get_db)):
+    """Ejecuta el modelo de predicción de riesgo para todos los alumnos de un upload."""
+    if not prediccion_service.modelo_disponible():
+        raise HTTPException(
+            status_code=503, 
+            detail="Modelo de predicción no disponible. Verifica que los artefactos .pkl estén en app/ml/"
+        )
+    
+    try:
+        resumen = prediccion_service.predecir_upload(db, upload_id)
+        return resumen
+    except Exception as e:
+        if "Upload no encontrado" in str(e):
+            raise HTTPException(status_code=404, detail=str(e))
+        logger.exception(f"Error al predecir upload {upload_id}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/predicciones/{upload_id}")
+def get_predicciones(upload_id: int, db: Session = Depends(get_db)):
+    """Devuelve las predicciones de un upload agrupadas por grupo."""
+    preds = db.query(Prediccion).join(Alumno).filter(Prediccion.upload_id == upload_id).all()
+    
+    if not preds:
+        return []
+
+    grupos_dict = {}
+    for p in preds:
+        gn = p.grupo_nombre or "Desconocido"
+        if gn not in grupos_dict:
+            grupos_dict[gn] = []
+        
+        grupos_dict[gn].append({
+            "matricula": p.alumno.matricula,
+            "nombre": p.alumno.nombre,
+            "carrera": p.alumno.carrera,
+            "prob_riesgo": float(p.prob_riesgo) if p.prob_riesgo is not None else 0.0,
+            "nivel_riesgo": p.nivel_riesgo,
+            "prediccion": p.prediccion
+        })
+
+    # Ordenar alumnos por prob_riesgo descendente y convertir a la lista final
+    result = []
+    # Ordenar grupos alfabéticamente para consistencia
+    for gn in sorted(grupos_dict.keys()):
+        alumnos = grupos_dict[gn]
+        alumnos_ordenados = sorted(alumnos, key=lambda x: x["prob_riesgo"], reverse=True)
+        result.append({
+            "grupo": gn,
+            "alumnos": alumnos_ordenados
+        })
+    
+    return result
+
+
+@router.get("/predicciones/{upload_id}/resumen")
+def get_predicciones_resumen(upload_id: int, db: Session = Depends(get_db)):
+    """Devuelve solo los conteos de riesgo por nivel para un upload."""
+    stats = db.query(
+        Prediccion.nivel_riesgo,
+        func.count(Prediccion.id).label("total")
+    ).filter(Prediccion.upload_id == upload_id).group_by(Prediccion.nivel_riesgo).all()
+
+    resumen = {"upload_id": upload_id, "alto": 0, "medio": 0, "bajo": 0, "total": 0}
+    total_gral = 0
+    for nivel, count in stats:
+        if nivel == "Alto":
+            resumen["alto"] = count
+        elif nivel == "Medio":
+            resumen["medio"] = count
+        elif nivel == "Bajo":
+            resumen["bajo"] = count
+        total_gral += count
+    
+    resumen["total"] = total_gral
+    return resumen

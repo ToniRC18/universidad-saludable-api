@@ -28,3 +28,7 @@ uploads/*.xls
 
 # Alembic
 alembic/versions/*.pyc
+
+# Machine Learning artifacts
+app/ml/*.pkl
+app/ml/*.json
