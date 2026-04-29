@@ -1,7 +1,7 @@
 import io
 import logging
-from decimal import Decimal
 from datetime import date
+from decimal import Decimal
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from fastapi import HTTPException
@@ -197,6 +197,7 @@ def process_upload(
             
             db.flush() # para obtener alumno.id si es nuevo
 
+            today = date.today()
             for iso_date, valor in dates.items():
                 d = date.fromisoformat(iso_date)
                 if d not in fechas_a_procesar:
@@ -210,9 +211,9 @@ def process_upload(
                     Asistencia.fecha == d
                 ).first()
 
-                # No crear nuevos registros con 0 para fechas vacías del template.
-                # El 0 solo se persiste si ya existía una asistencia previa.
-                if val == 0 and not asistencia:
+                # Persistir faltas reales (fechas pasadas o de hoy) y seguir ignorando
+                # celdas futuras vacías del template.
+                if val == 0 and not asistencia and d > today:
                     continue
 
                 if asistencia:

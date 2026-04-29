@@ -101,8 +101,10 @@ def generar_plantilla(
     ws_meta.cell(row=1, column=2, value=semestre_id)
     ws_meta.cell(row=2, column=1, value="horario_id")
     ws_meta.cell(row=2, column=2, value=horario_id)
-    ws_meta.cell(row=3, column=1, value="generada_at")
-    ws_meta.cell(row=3, column=2, value=datetime.now().isoformat())
+    ws_meta.cell(row=3, column=1, value="semestre_label")
+    ws_meta.cell(row=3, column=2, value=semestre.nombre)
+    ws_meta.cell(row=4, column=1, value="generada_at")
+    ws_meta.cell(row=4, column=2, value=datetime.now().isoformat())
     ws_meta.sheet_state = 'hidden'
 
     # Crea un sheet por cada grupo
@@ -145,8 +147,7 @@ def generar_plantilla(
         if carreras:
             list_formula = f'_catalogo!$A$1:$A${len(carreras)}'
             dv = DataValidation(type="list", formula1=list_formula, allow_blank=True)
-            # Aplicar a C3:C12
-            dv.add(f'C3:C12')
+            dv.add("C3:C500")
             ws.add_data_validation(dv)
 
     file_bytes = io.BytesIO()

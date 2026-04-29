@@ -44,15 +44,6 @@ class AlumnoEnRiesgo(BaseModel):
     porcentaje: float
 
 
-class TalleresPorCarrera(BaseModel):
-    carrera: str
-    nutricion: Optional[float]
-    fisio: Optional[float]
-    limpieza: Optional[float]
-    coae: Optional[float]
-    taller: Optional[float]
-
-
 class AsistenciaPorSemestre(BaseModel):
     semestre: str
     total_alumnos: int
@@ -482,72 +473,7 @@ def get_alumnos_en_riesgo_por_semestre(
 
 
 # ---------------------------------------------------------------------------
-# 4. Talleres por carrera
-# ---------------------------------------------------------------------------
-
-def get_talleres_por_carrera(db: Session, upload_id: int) -> list[TalleresPorCarrera]:
-    upload = _get_upload_or_404(db, upload_id)
-
-    q = _get_upload_alumnos_query(db, upload,
-        Alumno.carrera,
-        func.avg(Alumno.nutricion).label("nutricion"),
-        func.avg(Alumno.fisio).label("fisio"),
-        func.avg(Alumno.limpieza).label("limpieza"),
-        func.avg(Alumno.coae).label("coae"),
-        func.avg(Alumno.taller).label("taller")
-    )
-
-    rows = q.filter(Alumno.carrera.isnot(None)).group_by(Alumno.carrera).all()
-
-    return [
-        TalleresPorCarrera(
-            carrera=row.carrera,
-            nutricion=_r(row.nutricion),
-            fisio=_r(row.fisio),
-            limpieza=_r(row.limpieza),
-            coae=_r(row.coae),
-            taller=_r(row.taller),
-        )
-        for row in rows
-    ]
-
-
-def get_talleres_por_carrera_por_semestre(db: Session, semestre_id: int) -> list[TalleresPorCarrera]:
-    semestre = _get_semestre_or_404(db, semestre_id)
-    if not semestre.tiene_talleres:
-        return []
-
-    rows = (
-        _get_semestre_alumnos_query(
-            db,
-            semestre_id,
-            Alumno.carrera,
-            func.avg(Alumno.nutricion).label("nutricion"),
-            func.avg(Alumno.fisio).label("fisio"),
-            func.avg(Alumno.limpieza).label("limpieza"),
-            func.avg(Alumno.coae).label("coae"),
-            func.avg(Alumno.taller).label("taller"),
-        )
-        .filter(Alumno.carrera.isnot(None))
-        .group_by(Alumno.carrera)
-        .all()
-    )
-
-    return [
-        TalleresPorCarrera(
-            carrera=row.carrera,
-            nutricion=_r(row.nutricion),
-            fisio=_r(row.fisio),
-            limpieza=_r(row.limpieza),
-            coae=_r(row.coae),
-            taller=_r(row.taller),
-        )
-        for row in rows
-    ]
-
-
-# ---------------------------------------------------------------------------
-# 5. Asistencia por semestre del alumno
+# 4. Asistencia por semestre del alumno
 # ---------------------------------------------------------------------------
 
 def get_asistencia_por_semestre_alumno(db: Session, upload_id: int) -> list[AsistenciaPorSemestre]:

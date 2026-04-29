@@ -141,6 +141,9 @@ def parsear_resultados(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"No se pudo leer el archivo Excel: {exc}")
 
+    # Un nuevo upload del mismo periodo debe reemplazar la captura anterior.
+    db.query(ResultadoPrueba).filter(ResultadoPrueba.periodo_id == periodo_id).delete()
+
     total_procesadas = 0
     total_guardadas = 0
     total_saltadas = 0

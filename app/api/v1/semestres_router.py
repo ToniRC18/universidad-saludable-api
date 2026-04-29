@@ -63,13 +63,8 @@ def get_semestre(semestre_id: int, db: Session = Depends(get_db)):
 
 @router.patch("/{semestre_id}", response_model=SemestreOut)
 def update_semestre(semestre_id: int, updates: SemestreUpdate, db: Session = Depends(get_db)):
-    """Actualizar nombre, estado activo o flag de talleres."""
+    """Actualizar nombre o estado activo del semestre."""
     return semestres_service.update_semestre(db, semestre_id, updates)
-
-@router.patch("/{semestre_id}/tiene-talleres", response_model=SemestreOut)
-def update_tiene_talleres(semestre_id: int, tiene_talleres: bool, db: Session = Depends(get_db)):
-    """Actualizar específicamente si el semestre tiene talleres."""
-    return semestres_service.update_semestre(db, semestre_id, SemestreUpdate(tiene_talleres=tiene_talleres))
 
 
 @router.post("/{semestre_id}/finalizar", response_model=FinalizacionResponse, status_code=202)
@@ -78,8 +73,10 @@ def finalizar_semestre(semestre_id: int, db: Session = Depends(get_db)):
     semestre = semestres_service.get_semestre(db, semestre_id)
     if not semestre.activo:
         raise HTTPException(status_code=400, detail="El semestre ya está inactivo.")
+    if semestre.finalizando:
+        raise HTTPException(status_code=400, detail="El semestre ya se está finalizando.")
 
-    semestre.activo = False
+    semestre.finalizando = True
     db.commit()
     db.refresh(semestre)
 
@@ -97,7 +94,7 @@ def finalizar_semestre(semestre_id: int, db: Session = Depends(get_db)):
             start_new_session=True,
         )
     except Exception as exc:
-        semestre.activo = True
+        semestre.finalizando = False
         db.commit()
         raise HTTPException(
             status_code=500,
@@ -105,7 +102,7 @@ def finalizar_semestre(semestre_id: int, db: Session = Depends(get_db)):
         ) from exc
 
     return FinalizacionResponse(
-        message="Semestre marcado como finalizado. Re-entrenamiento iniciado en background.",
+        message="Finalización de semestre iniciada. Re-entrenamiento ejecutándose en background.",
         semestre_id=semestre_id,
         status="processing",
     )

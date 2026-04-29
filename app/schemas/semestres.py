@@ -79,7 +79,6 @@ class SemestreBase(BaseModel):
     total_semanas: int
     puntaje_maximo_asistencia: Decimal = Field(default=Decimal("60.0"))
     activo: bool = True
-    tiene_talleres: bool = False
 
 class SemestreCreate(BaseModel):
     nombre: str
@@ -87,12 +86,10 @@ class SemestreCreate(BaseModel):
     fecha_fin: date
     total_semanas: int
     puntaje_maximo_asistencia: Decimal = Field(default=Decimal("60.0"))
-    tiene_talleres: bool = False
 
 class SemestreUpdate(BaseModel):
     nombre: Optional[str] = None
     activo: Optional[bool] = None
-    tiene_talleres: Optional[bool] = None
 
 class SemestreOut(SemestreBase):
     id: int

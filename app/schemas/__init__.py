@@ -135,15 +135,3 @@ class AsistenciaOut(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-# ---------- Talleres (análisis comparativo) ----------
-
-class TallerGrupoStats(BaseModel):
-    grupo_id: int
-    grupo_nombre: str
-    avg_nutricion: Optional[float]
-    avg_fisio: Optional[float]
-    avg_limpieza: Optional[float]
-    avg_coae: Optional[float]
-    avg_taller: Optional[float]

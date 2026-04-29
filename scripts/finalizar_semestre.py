@@ -15,6 +15,7 @@ Uso:
 import argparse
 import csv
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -22,12 +23,21 @@ import sys
 import time
 from pathlib import Path
 
+from app.db.session import SessionLocal
+from app.models.semestres import Semestre
+
 
 BASE = Path(__file__).resolve().parent.parent
 CODE = Path.home() / "Code"
 ML_DIR = BASE / "app" / "ml"
 RELOAD_FLAG = ML_DIR / ".reload_flag"
 STATUS_FILE = ML_DIR / ".finalizacion_status.json"
+ARTEFACTOS_ML = (
+    "modelo_riesgo.pkl",
+    "encoder_carrera.pkl",
+    "imputer.pkl",
+    "metadata.json",
+)
 
 
 def _write_status(semestre_id: int, status: str, step: str, message: str | None = None) -> None:
@@ -77,6 +87,60 @@ def _count_csv_rows(path: Path) -> int:
         return sum(1 for _ in reader)
 
 
+def _set_semestre_estado(semestre_id: int, *, activo: bool, finalizando: bool) -> None:
+    db = SessionLocal()
+    try:
+        semestre = db.query(Semestre).filter(Semestre.id == semestre_id).first()
+        if semestre is None:
+            raise RuntimeError(f"Semestre {semestre_id} no encontrado para actualizar estado.")
+
+        semestre.activo = activo
+        semestre.finalizando = finalizando
+        db.commit()
+    finally:
+        db.close()
+
+
+def _get_semestre_nombre(semestre_id: int) -> str:
+    db = SessionLocal()
+    try:
+        semestre = db.query(Semestre).filter(Semestre.id == semestre_id).first()
+        if semestre is None:
+            raise RuntimeError(f"Semestre {semestre_id} no encontrado para obtener nombre.")
+        return semestre.nombre
+    finally:
+        db.close()
+
+
+def _normalizar_semestre_label(nombre: str) -> str:
+    parts = str(nombre).strip().split()
+    if len(parts) < 3:
+        return nombre
+
+    month_map = {
+        "enero": "Ene",
+        "febrero": "Feb",
+        "marzo": "Mar",
+        "abril": "Abr",
+        "mayo": "May",
+        "junio": "Jun",
+        "julio": "Jul",
+        "agosto": "Ago",
+        "septiembre": "Sep",
+        "octubre": "Oct",
+        "noviembre": "Nov",
+        "diciembre": "Dic",
+    }
+
+    inicio = month_map.get(parts[0].lower())
+    fin = month_map.get(parts[1].lower())
+    year = parts[2]
+    if inicio and fin and year.isdigit():
+        return f"{inicio}-{fin} {year}"
+
+    return nombre
+
+
 def paso1_exportar(semestre_id: int) -> int:
     print("📤 Exportando datos de BD...")
     stdout = _run_step(
@@ -110,7 +174,7 @@ def paso2_generar_dataset() -> int:
     return total
 
 
-def paso3_entrenar() -> tuple[str, str]:
+def paso3_entrenar(semestre_actual: str) -> tuple[str, str]:
     print("🤖 Entrenando modelo...")
     stdout = _run_step(
         [
@@ -120,6 +184,8 @@ def paso3_entrenar() -> tuple[str, str]:
             str(CODE / "dataset" / "dataset_modelo.csv"),
             "--output",
             str(CODE / "modelo"),
+            "--semestre-actual",
+            semestre_actual,
         ]
     )
     match = re.search(r"Mejor modelo:\s*(.+?)\s*\(F1=(\d+\.\d+)\)", stdout)
@@ -131,21 +197,56 @@ def paso3_entrenar() -> tuple[str, str]:
 
 def paso4_reemplazar_artefactos() -> None:
     print("📦 Actualizando artefactos...")
-    ml_dir = BASE / "app" / "ml"
-    missing = []
+    tmp_dir = ML_DIR / "tmp_nuevo"
+    backup_dir = ML_DIR / "tmp_backup"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    for archivo in ["modelo_riesgo.pkl", "encoder_carrera.pkl", "imputer.pkl", "metadata.json"]:
-        src = CODE / "modelo" / archivo
-        dst = ml_dir / archivo
-        if src.exists():
-            shutil.copy2(src, dst)
+    try:
+        for archivo in ARTEFACTOS_ML:
+            src = CODE / "modelo" / archivo
+            if not src.exists():
+                raise FileNotFoundError(f"No se encontró artefacto requerido: {archivo}")
+            if src.stat().st_size <= 0:
+                raise ValueError(f"Artefacto vacío en origen: {archivo}")
+
+            shutil.copy2(src, tmp_dir / archivo)
+
+        for archivo in ARTEFACTOS_ML:
+            staged = tmp_dir / archivo
+            if not staged.exists() or staged.stat().st_size <= 0:
+                raise ValueError(f"Artefacto inválido en staging: {archivo}")
+
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        for archivo in ARTEFACTOS_ML:
+            actual = ML_DIR / archivo
+            if actual.exists():
+                shutil.copy2(actual, backup_dir / archivo)
+
+        for archivo in ARTEFACTOS_ML:
+            os.replace(tmp_dir / archivo, ML_DIR / archivo)
             print(f"  ✅ {archivo}")
-        else:
-            missing.append(archivo)
 
-    if missing:
-        missing_str = ", ".join(missing)
-        raise FileNotFoundError(f"No se encontraron artefactos requeridos: {missing_str}")
+        for archivo in ARTEFACTOS_ML:
+            final = ML_DIR / archivo
+            if not final.exists() or final.stat().st_size <= 0:
+                raise ValueError(f"Artefacto inválido después del swap: {archivo}")
+    except Exception as exc:
+        for archivo in ARTEFACTOS_ML:
+            backup = backup_dir / archivo
+            final = ML_DIR / archivo
+            if backup.exists():
+                os.replace(backup, final)
+            elif final.exists():
+                final.unlink()
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        raise RuntimeError(f"Swap atómico de artefactos falló: {exc}") from exc
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    shutil.rmtree(backup_dir, ignore_errors=True)
 
     print("📦 Actualizando artefactos... OK")
 
@@ -176,8 +277,10 @@ def main() -> None:
 
     start = time.perf_counter()
     ML_DIR.mkdir(parents=True, exist_ok=True)
-    RELOAD_FLAG.write_text("processing", encoding="utf-8")
+    if RELOAD_FLAG.exists():
+        RELOAD_FLAG.unlink()
     _write_status(args.semestre_id, "processing", "starting", "Pipeline iniciado")
+    semestre_actual = _normalizar_semestre_label(_get_semestre_nombre(args.semestre_id))
 
     try:
         print(f"🚀 Iniciando finalización del semestre ID={args.semestre_id}")
@@ -188,19 +291,21 @@ def main() -> None:
         paso2_generar_dataset()
 
         _write_status(args.semestre_id, "processing", "training_model", "Re-entrenando modelo")
-        paso3_entrenar()
+        paso3_entrenar(semestre_actual)
 
         _write_status(args.semestre_id, "processing", "updating_artifacts", "Copiando artefactos")
         paso4_reemplazar_artefactos()
 
         _write_status(args.semestre_id, "processing", "waiting_reload", "Artefactos listos para recarga")
         paso5_senalizar_recarga()
+        _set_semestre_estado(args.semestre_id, activo=False, finalizando=False)
 
         elapsed = round(time.perf_counter() - start)
         print(f"✅ Proceso completado en {elapsed}s")
     except Exception as exc:
         if RELOAD_FLAG.exists():
             RELOAD_FLAG.unlink()
+        _set_semestre_estado(args.semestre_id, activo=True, finalizando=False)
         _write_status(args.semestre_id, "idle", "failed", str(exc))
         print(f"❌ Error en la finalización del semestre: {exc}")
         raise

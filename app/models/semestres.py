@@ -24,7 +24,7 @@ class Semestre(Base):
     total_semanas = Column(Integer, nullable=False)
     puntaje_maximo_asistencia = Column(Numeric(6, 2), default=60.0, nullable=False)
     activo = Column(Boolean, default=True, nullable=False)
-    tiene_talleres = Column(Boolean, nullable=False, default=False)
+    finalizando = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     horarios = relationship("Horario", back_populates="semestre", cascade="all, delete-orphan")
@@ -83,4 +83,3 @@ class UploadsHorario(Base):
     ultima_fecha_subida = Column(Date, nullable=True)
     ultimo_upload_at = Column(DateTime(timezone=True), nullable=True)
     total_alumnos = Column(Integer, nullable=True)
-

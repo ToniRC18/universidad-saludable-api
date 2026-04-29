@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def leer_meta(wb: openpyxl.Workbook) -> dict:
     """Busca la hoja _meta en el workbook y extrae semestre_id e horario_id."""
     if "_meta" not in wb.sheetnames:
-        return {"semestre_id": 0, "horario_id": 0}  # Regresar 0 para históricos, no crashear
+        raise ValueError("Falta la hoja _meta. Descarga la plantilla oficial desde el módulo de semestres.")
     
     ws = wb["_meta"]
     meta_data = {}

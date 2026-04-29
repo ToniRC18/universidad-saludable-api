@@ -7,11 +7,11 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.models import Alumno, Asistencia, Grupo, Upload, Prediccion, Semestre
+from app.models.semestres import Horario
 from app.schemas import (
     AlumnoOut,
     AsistenciaOut,
     GrupoOut,
-    TallerGrupoStats,
     UploadOut,
     UploadUpsertResponse,
     AlumnoUpdate,
@@ -27,7 +27,6 @@ from app.services.stats_service import (
     AsistenciaPorCarrera,
     TendenciaGrupo,
     AlumnoEnRiesgo,
-    TalleresPorCarrera,
     AsistenciaPorSemestre,
     RankingGrupo,
     SemestreResumen,
@@ -43,12 +42,89 @@ router.include_router(carreras_router, prefix="/carreras")
 ALLOWED_EXTENSIONS = {".xlsx", ".xls"}
 
 
+def _latest_upload_for_horario(db: Session, semestre_id: int, horario_id: int) -> Optional[Upload]:
+    return (
+        db.query(Upload)
+        .filter(
+            Upload.semestre_id == semestre_id,
+            Upload.horario_id == horario_id,
+        )
+        .order_by(Upload.uploaded_at.desc(), Upload.id.desc())
+        .first()
+    )
+
+
+def _get_upload_or_404(db: Session, upload_id: int) -> Upload:
+    upload = db.query(Upload).filter(Upload.id == upload_id).first()
+    if not upload:
+        raise HTTPException(status_code=404, detail=f"Upload {upload_id} no encontrado.")
+    return upload
+
+
+def _predicciones_detalle_por_upload(db: Session, upload_id: int) -> list[dict]:
+    preds = db.query(Prediccion).join(Alumno).filter(Prediccion.upload_id == upload_id).all()
+    if not preds:
+        return []
+
+    grupos_dict: dict[str, list[dict]] = {}
+    for p in preds:
+        grupo_nombre = p.grupo_nombre or "Desconocido"
+        grupos_dict.setdefault(grupo_nombre, []).append(
+            {
+                "matricula": p.alumno.matricula,
+                "nombre": p.alumno.nombre,
+                "carrera": p.alumno.carrera,
+                "prob_riesgo": float(p.prob_riesgo) if p.prob_riesgo is not None else 0.0,
+                "nivel_riesgo": p.nivel_riesgo,
+                "prediccion": p.prediccion,
+            }
+        )
+
+    result = []
+    for grupo_nombre in sorted(grupos_dict.keys()):
+        alumnos = grupos_dict[grupo_nombre]
+        result.append(
+            {
+                "grupo": grupo_nombre,
+                "alumnos": sorted(alumnos, key=lambda item: item["prob_riesgo"], reverse=True),
+            }
+        )
+    return result
+
+
+def _predicciones_resumen_por_upload(db: Session, upload_id: int) -> dict:
+    stats = (
+        db.query(
+            Prediccion.nivel_riesgo,
+            func.count(Prediccion.id).label("total")
+        )
+        .filter(Prediccion.upload_id == upload_id)
+        .group_by(Prediccion.nivel_riesgo)
+        .all()
+    )
+
+    resumen = {"upload_id": upload_id, "alto": 0, "medio": 0, "bajo": 0, "total": 0}
+    total_gral = 0
+    for nivel, count in stats:
+        if nivel == "Alto":
+            resumen["alto"] = count
+        elif nivel == "Medio":
+            resumen["medio"] = count
+        elif nivel == "Bajo":
+            resumen["bajo"] = count
+        total_gral += count
+
+    resumen["total"] = total_gral
+    return resumen
+
+
 # ---------------------------------------------------------------------------
 # POST /uploads
 # ---------------------------------------------------------------------------
 
 @router.post("/uploads", response_model=UploadUpsertResponse, status_code=201)
 async def upload_excel(
+    http_response: Response,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -69,7 +145,7 @@ async def upload_excel(
         raise HTTPException(status_code=400, detail="El archivo está vacío.")
 
     try:
-        response = process_upload(
+        upload_response = process_upload(
             db=db,
             filename=file.filename,
             file_bytes=file_bytes,
@@ -83,13 +159,10 @@ async def upload_excel(
         raise HTTPException(status_code=500, detail="Error interno al procesar el archivo.")
 
     # Si fue analizado y no actualizado (HTTP 200 informativo)
-    if not response.actualizado:
-        from fastapi import Response
-        # Se envía 200 explícito por sobre el status_code del decorador
-        pass # Status code defaults to 201 via decorator, but that is fine for non-update successes or we could modify response on access.
-             # Actually, FastAPI permits modifying the response code using a response injected object, but returning the response dict is sufficient here.
+    if not upload_response.actualizado:
+        http_response.status_code = 200
 
-    return response
+    return upload_response
 
 
 # ---------------------------------------------------------------------------
@@ -169,20 +242,6 @@ def stats_alumnos_en_riesgo(
     return stats_service.get_alumnos_en_riesgo(db, upload_id, umbral, grupo_id)
 
 
-@router.get("/stats/uploads/{upload_id}/talleres-por-carrera", response_model=list[TalleresPorCarrera], tags=["stats"])
-def stats_talleres_por_carrera(upload_id: int, db: Session = Depends(get_db)):
-    upload = db.query(Upload).filter(Upload.id == upload_id).first()
-    if not upload:
-        raise HTTPException(status_code=404, detail=f"Upload {upload_id} no encontrado.")
-    
-    if upload.semestre_id:
-        semestre = db.query(Semestre).filter(Semestre.id == upload.semestre_id).first()
-        if semestre and not semestre.tiene_talleres:
-            return Response(status_code=204)
-            
-    return stats_service.get_talleres_por_carrera(db, upload_id)
-
-
 @router.get("/stats/uploads/{upload_id}/asistencia-por-semestre-alumno", response_model=list[AsistenciaPorSemestre], tags=["stats"])
 def stats_asistencia_por_semestre_alumno(upload_id: int, db: Session = Depends(get_db)):
     return stats_service.get_asistencia_por_semestre_alumno(db, upload_id)
@@ -220,11 +279,6 @@ def stats_alumnos_en_riesgo_semestre(
 @router.get("/stats/semestres/{semestre_id}/ranking-grupos", response_model=list[RankingGrupo], tags=["stats"])
 def stats_ranking_grupos_semestre(semestre_id: int, db: Session = Depends(get_db)):
     return stats_service.get_ranking_grupos_por_semestre(db, semestre_id)
-
-
-@router.get("/stats/semestres/{semestre_id}/talleres-por-carrera", response_model=list[TalleresPorCarrera], tags=["stats"])
-def stats_talleres_por_carrera_semestre(semestre_id: int, db: Session = Depends(get_db)):
-    return stats_service.get_talleres_por_carrera_por_semestre(db, semestre_id)
 
 
 @router.get("/stats/semestres/{semestre_id}/asistencia-por-semestre-alumno", response_model=list[AsistenciaPorSemestre], tags=["stats"])
@@ -298,56 +352,6 @@ def update_alumno_activo(alumno_id: int, updates: AlumnoUpdate, db: Session = De
 
 
 # ---------------------------------------------------------------------------
-# GET /uploads/{upload_id}/talleres
-# ---------------------------------------------------------------------------
-
-@router.get("/uploads/{upload_id}/talleres", response_model=list[TallerGrupoStats])
-def get_talleres(upload_id: int, db: Session = Depends(get_db)):
-    """
-    Por cada grupo del archivo, calcula los promedios de NUTRICION, FISIO,
-    LIMPIEZA, COAE y TALLER para análisis comparativo.
-    """
-    upload = db.query(Upload).filter(Upload.id == upload_id).first()
-    if not upload:
-        raise HTTPException(status_code=404, detail=f"Upload {upload_id} no encontrado.")
-
-    if upload.semestre_id:
-        semestre = db.query(Semestre).filter(Semestre.id == upload.semestre_id).first()
-        if semestre and not semestre.tiene_talleres:
-            return Response(status_code=204)
-
-    grupos = db.query(Grupo).filter(Grupo.upload_id == upload_id).all()
-
-    result = []
-    for g in grupos:
-        row = (
-            db.query(
-                func.avg(Alumno.nutricion).label("avg_nutricion"),
-                func.avg(Alumno.fisio).label("avg_fisio"),
-                func.avg(Alumno.limpieza).label("avg_limpieza"),
-                func.avg(Alumno.coae).label("avg_coae"),
-                func.avg(Alumno.taller).label("avg_taller"),
-            )
-            .filter(Alumno.grupo_id == g.id)
-            .one()
-        )
-
-        result.append(
-            TallerGrupoStats(
-                grupo_id=g.id,
-                grupo_nombre=g.nombre,
-                avg_nutricion=float(row.avg_nutricion) if row.avg_nutricion is not None else None,
-                avg_fisio=float(row.avg_fisio) if row.avg_fisio is not None else None,
-                avg_limpieza=float(row.avg_limpieza) if row.avg_limpieza is not None else None,
-                avg_coae=float(row.avg_coae) if row.avg_coae is not None else None,
-                avg_taller=float(row.avg_taller) if row.avg_taller is not None else None,
-            )
-        )
-
-    return result
-
-
-# ---------------------------------------------------------------------------
 # PREDICCIONES ML
 # ---------------------------------------------------------------------------
 
@@ -364,67 +368,110 @@ def post_predecir_riesgo(upload_id: int, db: Session = Depends(get_db)):
         resumen = prediccion_service.predecir_upload(db, upload_id)
         return resumen
     except Exception as e:
-        if "Upload no encontrado" in str(e):
+        if isinstance(e, FileNotFoundError):
             raise HTTPException(status_code=404, detail=str(e))
+        if isinstance(e, ValueError):
+            raise HTTPException(status_code=400, detail=str(e))
         logger.exception(f"Error al predecir upload {upload_id}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/predicciones/semestre/{semestre_id}")
+def get_predicciones_semestre(semestre_id: int, db: Session = Depends(get_db)):
+    """Devuelve predicciones agrupadas por horario para todo el semestre."""
+    semestre = db.query(Semestre).filter(Semestre.id == semestre_id).first()
+    if not semestre:
+        raise HTTPException(status_code=404, detail="Semestre no encontrado")
+
+    horarios_out = []
+    total_alto = 0
+    total_medio = 0
+    total_bajo = 0
+    total_alumnos = 0
+
+    for horario in sorted(semestre.horarios, key=lambda item: item.id):
+        latest_upload = _latest_upload_for_horario(db, semestre_id, horario.id)
+        upload_id = latest_upload.id if latest_upload else None
+        resumen = _predicciones_resumen_por_upload(db, upload_id) if upload_id is not None else None
+        grupos = _predicciones_detalle_por_upload(db, upload_id) if upload_id is not None else []
+        tiene_predicciones = bool(resumen and resumen["total"] > 0)
+
+        alto = resumen["alto"] if resumen else 0
+        medio = resumen["medio"] if resumen else 0
+        bajo = resumen["bajo"] if resumen else 0
+        total = resumen["total"] if resumen else 0
+
+        total_alto += alto
+        total_medio += medio
+        total_bajo += bajo
+        total_alumnos += total
+
+        horarios_out.append(
+            {
+                "horario_id": horario.id,
+                "horario_nombre": horario.nombre,
+                "upload_id": upload_id,
+                "alto": alto,
+                "medio": medio,
+                "bajo": bajo,
+                "total": total,
+                "tiene_predicciones": tiene_predicciones,
+                "grupos": grupos,
+            }
+        )
+
+    return {
+        "semestre_id": semestre_id,
+        "total_alto": total_alto,
+        "total_medio": total_medio,
+        "total_bajo": total_bajo,
+        "total_alumnos": total_alumnos,
+        "horarios": horarios_out,
+    }
+
+
+@router.post("/predicciones/semestre/{semestre_id}/horario/{horario_id}")
+def post_predecir_horario_semestre(semestre_id: int, horario_id: int, db: Session = Depends(get_db)):
+    """Re-corre la predicción para el upload más reciente de un horario dentro de un semestre."""
+    if not prediccion_service.modelo_disponible():
+        raise HTTPException(
+            status_code=503,
+            detail="Modelo de predicción no disponible. Verifica que los artefactos .pkl estén en app/ml/"
+        )
+
+    semestre = db.query(Semestre).filter(Semestre.id == semestre_id).first()
+    if not semestre:
+        raise HTTPException(status_code=404, detail="Semestre no encontrado")
+
+    horario = db.query(Horario).filter(Horario.id == horario_id, Horario.semestre_id == semestre_id).first()
+    if not horario:
+        raise HTTPException(status_code=404, detail="Horario no encontrado en este semestre")
+
+    latest_upload = _latest_upload_for_horario(db, semestre_id, horario_id)
+    if not latest_upload:
+        raise HTTPException(
+            status_code=404,
+            detail="No hay uploads para ese horario dentro del semestre indicado",
+        )
+
+    try:
+        return prediccion_service.predecir_upload(db, latest_upload.id)
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise HTTPException(status_code=400, detail=str(e))
+        logger.exception("Error al predecir semestre=%s horario=%s", semestre_id, horario_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/predicciones/{upload_id}")
 def get_predicciones(upload_id: int, db: Session = Depends(get_db)):
     """Devuelve las predicciones de un upload agrupadas por grupo."""
-    preds = db.query(Prediccion).join(Alumno).filter(Prediccion.upload_id == upload_id).all()
-    
-    if not preds:
-        return []
-
-    grupos_dict = {}
-    for p in preds:
-        gn = p.grupo_nombre or "Desconocido"
-        if gn not in grupos_dict:
-            grupos_dict[gn] = []
-        
-        grupos_dict[gn].append({
-            "matricula": p.alumno.matricula,
-            "nombre": p.alumno.nombre,
-            "carrera": p.alumno.carrera,
-            "prob_riesgo": float(p.prob_riesgo) if p.prob_riesgo is not None else 0.0,
-            "nivel_riesgo": p.nivel_riesgo,
-            "prediccion": p.prediccion
-        })
-
-    # Ordenar alumnos por prob_riesgo descendente y convertir a la lista final
-    result = []
-    # Ordenar grupos alfabéticamente para consistencia
-    for gn in sorted(grupos_dict.keys()):
-        alumnos = grupos_dict[gn]
-        alumnos_ordenados = sorted(alumnos, key=lambda x: x["prob_riesgo"], reverse=True)
-        result.append({
-            "grupo": gn,
-            "alumnos": alumnos_ordenados
-        })
-    
-    return result
+    _get_upload_or_404(db, upload_id)
+    return _predicciones_detalle_por_upload(db, upload_id)
 
 
 @router.get("/predicciones/{upload_id}/resumen")
 def get_predicciones_resumen(upload_id: int, db: Session = Depends(get_db)):
     """Devuelve solo los conteos de riesgo por nivel para un upload."""
-    stats = db.query(
-        Prediccion.nivel_riesgo,
-        func.count(Prediccion.id).label("total")
-    ).filter(Prediccion.upload_id == upload_id).group_by(Prediccion.nivel_riesgo).all()
-
-    resumen = {"upload_id": upload_id, "alto": 0, "medio": 0, "bajo": 0, "total": 0}
-    total_gral = 0
-    for nivel, count in stats:
-        if nivel == "Alto":
-            resumen["alto"] = count
-        elif nivel == "Medio":
-            resumen["medio"] = count
-        elif nivel == "Bajo":
-            resumen["bajo"] = count
-        total_gral += count
-    
-    resumen["total"] = total_gral
-    return resumen
+    _get_upload_or_404(db, upload_id)
+    return _predicciones_resumen_por_upload(db, upload_id)

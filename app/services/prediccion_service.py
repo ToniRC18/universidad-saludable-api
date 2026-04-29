@@ -1,5 +1,6 @@
 import json
 import logging
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -196,6 +197,42 @@ def _valor_por_sesion(valores: list[float], max_asistencia: float, total_semanas
     return 2.5
 
 
+def normalizar_semestre_cursando(val) -> int:
+    normalized = "".join(
+        c for c in unicodedata.normalize("NFD", str(val).lower())
+        if unicodedata.category(c) != "Mn"
+    ).strip()
+    if normalized.isdigit():
+        semestre = int(normalized)
+        return semestre if 1 <= semestre <= 6 else 0
+
+    semestre_map = {
+        "1 sem": 1,
+        "1 semestre": 1,
+        "1 er semestre": 1,
+        "1er": 1,
+        "1er semestre": 1,
+        "primer": 1,
+        "primero": 1,
+        "2do": 2,
+        "segundo": 2,
+        "3er": 3,
+        "tercero": 3,
+        "4 semestre": 4,
+        "4 semestre ": 4,
+        "4to": 4,
+        "4to semestre": 4,
+        "cuarto": 4,
+        "5to": 5,
+        "quinto": 5,
+        "6 semestre": 6,
+        "6to": 6,
+        "6to semestre": 6,
+        "sexto": 6,
+    }
+    return semestre_map.get(normalized, 0)
+
+
 def _build_features(alumno: Alumno) -> dict[str, float]:
     total_semanas_modelo = max(len(_week_feature_cols()), 1)
     total_semanas_semestre = getattr(alumno.grupo_semestre.semestre, "total_semanas", None) if alumno.grupo_semestre else None
@@ -209,6 +246,36 @@ def _build_features(alumno: Alumno) -> dict[str, float]:
 
     asistencias = sorted(alumno.asistencias, key=lambda item: item.fecha)
     valores = [float(asistencia.valor) for asistencia in asistencias]
+
+    dias_por_semana = 2
+    if alumno.grupo_semestre and alumno.grupo_semestre.horario:
+        horario = alumno.grupo_semestre.horario
+        dias_sub_bloque_1 = [horario.dia_1, horario.dia_2]
+        dias_sub_bloque_2 = [horario.dia_3, horario.dia_4]
+
+        if alumno.grupo_semestre.sub_bloque == 1:
+            dias_por_semana = sum(1 for dia in dias_sub_bloque_1 if dia)
+        elif alumno.grupo_semestre.sub_bloque == 2:
+            dias_por_semana = sum(1 for dia in dias_sub_bloque_2 if dia)
+        else:
+            dias_por_semana = sum(
+                1 for dia in [horario.dia_1, horario.dia_2, horario.dia_3, horario.dia_4]
+                if dia
+            )
+
+        dias_por_semana = dias_por_semana or 2
+
+    sesiones_esperadas = total_semanas_semestre * dias_por_semana
+    sesiones_faltantes = max(sesiones_esperadas - len(valores), 0)
+    if sesiones_faltantes >= dias_por_semana:
+        logger.warning(
+            "Serie de asistencias incompleta para matricula=%s: %s sesiones faltantes (esperadas=%s, reales=%s)",
+            alumno.matricula,
+            sesiones_faltantes,
+            sesiones_esperadas,
+            len(valores),
+        )
+
     valor_sesion = _valor_por_sesion(valores, max_asistencia, total_semanas_semestre)
     max_pts_semana = valor_sesion * 2
 
@@ -260,7 +327,7 @@ def predecir_upload(db: Session, upload_id: int) -> dict[str, Any]:
 
     upload = db.query(Upload).filter(Upload.id == upload_id).first()
     if not upload:
-        raise Exception("Upload no encontrado")
+        raise FileNotFoundError("Upload no encontrado")
 
     if upload.semestre_id and upload.horario_id:
         grupos_ids = [
@@ -274,17 +341,10 @@ def predecir_upload(db: Session, upload_id: int) -> dict[str, Any]:
     else:
         alumnos_query = db.query(Alumno).join(Grupo, Alumno.grupo_id == Grupo.id).filter(Grupo.upload_id == upload_id)
 
-    alumnos_list = alumnos_query.all()
+    alumnos_list = alumnos_query.filter(Alumno.activo.is_(True)).all()
 
     if not alumnos_list:
-        return {
-            "upload_id": upload_id,
-            "total_alumnos": 0,
-            "alto": 0,
-            "medio": 0,
-            "bajo": 0,
-            "created_at": datetime.now().isoformat(),
-        }
+        raise ValueError("El upload no tiene alumnos activos para predecir.")
 
     conteo = {"alto": 0, "medio": 0, "bajo": 0}
     columnas_modelo = _feature_cols()
